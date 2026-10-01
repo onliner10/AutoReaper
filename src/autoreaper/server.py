@@ -7,12 +7,12 @@ import math
 import re
 import time
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Literal
 from uuid import uuid4
 
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
-from pydantic import Field
+from pydantic import BaseModel, Field
 
 from .bridge import (BRIDGE_SCRIPT_NAME, LUA, PROTOCOL, BridgeError, ReaperBridge, default_reaper_resource_path,
                      home_directory, install_bridge_script, lua_string)
@@ -165,13 +165,21 @@ async def install_bridge(
         reaper_resource_path: Annotated[str | None, Field(
             description="REAPER's resource folder (Options > Show REAPER resource path). "
                         'Omit for the default install location.')] = None) -> str:
-    """Copy the AutoReaper Bridge script into REAPER's Scripts folder (overwrites an older copy).
-    Afterwards the user starts it once per REAPER session: Actions > Show action list > New action >
-    Load ReaScript > pick the script > Run (or add it to Scripts/__startup.lua to start automatically)."""
+    """Copy the AutoReaper Bridge script into REAPER's Scripts folder (overwrites an older copy). A running
+    bridge reloads the new copy by itself. Otherwise the user starts it once per REAPER session: Actions >
+    Show action list > New action > Load ReaScript > pick the script > Run (or add it to
+    Scripts/__startup.lua to start automatically)."""
     try:
         path = await asyncio.to_thread(install_bridge_script, reaper_resource_path)
     except OSError as error:
         return output({'ok': False, 'error': str(error)}, 'install')
+    try:
+        reloaded = await asyncio.to_thread(bridge.reload)
+    except BridgeError as error:
+        return output({'ok': True, 'installed': str(path), 'reloaded': False, 'next': str(error)}, 'install')
+    if reloaded is not None:
+        return output({'ok': True, 'installed': str(path), 'reloaded': True,
+                       'bridge_protocol': reloaded.get('protocol')}, 'install')
     return output({'ok': True, 'installed': str(path), 'mailbox': str(bridge.directory),
                    'next': f'In REAPER: Actions > Show action list > New action > Load ReaScript, choose '
                            f'"{BRIDGE_SCRIPT_NAME}", then Run. If an older copy is already running, run it '
@@ -303,6 +311,313 @@ async def reaper_eval_write(
     except Exception as error:
         return output({'ok': False, 'error': str(error), 'outcome': 'unknown; inspect the project before retrying'},
                       'reaper_eval_write')
+
+
+# ----------------------------------------------------------------- plugins
+
+TrackRef = Annotated[str, Field(description='Track GUID, "master", or an exact track name.')]
+FxRef = Annotated[str | int, Field(description='FX GUID, zero-based index in the chain, or a unique part of its name.')]
+FX_WRITE = ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False)
+
+
+def lua_value(value):
+    """A Python value as a Lua literal."""
+    if value is None:
+        return 'nil'
+    if isinstance(value, bool):
+        return 'true' if value else 'false'
+    if isinstance(value, (int, float)):
+        if not math.isfinite(value):
+            raise ValueError('numbers must be finite')
+        return repr(value)
+    if isinstance(value, str):
+        return lua_string(value)
+    if isinstance(value, (list, tuple)):
+        return '{' + ','.join(lua_value(v) for v in value) + '}'
+    if isinstance(value, dict):
+        return '{' + ','.join('[' + lua_string(str(k)) + ']=' + lua_value(v) for k, v in value.items()) + '}'
+    raise ValueError(f'cannot pass {type(value).__name__} to Lua')
+
+
+def fx_program(body, **arguments):
+    """fx.lua as the local `fx`, the arguments as the local `args`, then the body."""
+    return ('local fx=(function()\n' + (LUA / 'fx.lua').read_text(encoding='utf-8') + '\nend)()\n'
+            'local args=' + lua_value(arguments) + '\n' + body)
+
+
+async def fx_write(body, label, **arguments):
+    """Run an FX edit as one Undo step in the active project."""
+    status = await asyncio.to_thread(bridge.status)
+    receipt = await bridge.evaluate(fx_program(body, **arguments), project_id=status['project_id'], label=label)
+    if not receipt.get('ok'):
+        return {'ok': False, 'error': receipt.get('error'), 'outcome': receipt.get('outcome'),
+                'partial_change_possible': receipt.get('partial_change_possible')}
+    result = receipt.get('result')
+    if isinstance(result, dict) and result.get('ok') is False:
+        return result
+    return {'ok': True, 'changed': receipt.get('changed'), 'undo': label,
+            **(result if isinstance(result, dict) else {'result': result})}
+
+
+ADD_FX = '''
+local track, track_name = fx.track(args.track)
+local words = {}
+for w in args.name:lower():gmatch('%S+') do words[#words + 1] = w end
+local exact, hits = nil, {}
+for i = 0, 19999 do
+  local ok, name, ident = reaper.EnumInstalledFX(i)
+  if not ok then break end
+  local lowered = name:lower()
+  local bare = lowered:gsub('^[%w ]+:%s*', ''):gsub('%s*%b()%s*$', '')
+  if lowered == args.name:lower() or bare == args.name:lower() or (ident or ''):lower() == args.name:lower() then
+    exact = exact or name
+  end
+  local all = true
+  for _, w in ipairs(words) do if not lowered:find(w, 1, true) then all = false; break end end
+  if all then hits[#hits + 1] = name end
+end
+local chosen = exact or (#hits == 1 and hits[1]) or nil
+if not chosen then
+  return {ok = false, error = #hits == 0 and ('No installed plugin matches "' .. args.name .. '"; try fewer words') or
+    'Several plugins match; pass one exact name from candidates', candidates = {table.unpack(hits, 1, math.min(#hits, 40))}}
+end
+local position = args.position and (-1000 - args.position) or -1
+local index = reaper.TrackFX_AddByName(track, chosen, false, position)
+assert(index >= 0, 'REAPER could not load ' .. chosen)
+if args.bypassed then reaper.TrackFX_SetEnabled(track, index, false) end
+return {track = track_name, added = fx.describe(track, index), chain = fx.chain(track)}
+'''
+
+
+@mcp.tool(annotations=FX_WRITE, structured_output=False)
+async def add_fx(
+        track: TrackRef,
+        name: Annotated[str, Field(description='Plugin name or words from it, e.g. "ReaEQ" or "pro q 3"; an exact '
+                                               'name from search_installed_fx when several match.')],
+        position: Annotated[int | None, Field(ge=0, description='Zero-based position in the chain; omit for the end.')] = None,
+        bypassed: Annotated[bool, Field(description='Insert it bypassed, to set it up before it is heard.')] = False) -> str:
+    """Add a plugin to a track's FX chain (or the master's) by name. If several installed plugins match,
+    nothing is added and the candidates are listed. One Undo step. Returns the new FX's GUID and the chain."""
+    try:
+        return output(await fx_write(ADD_FX, f'Add FX {name}', track=track, name=name, position=position,
+                                     bypassed=bypassed), 'add_fx')
+    except Exception as error:
+        return output({'ok': False, 'error': str(error)}, 'add_fx')
+
+
+FX_PARAMETERS = '''
+local track, track_name = fx.track(args.track)
+local index = fx.find(track, args.fx)
+local words = {}
+for w in (args.query or ''):lower():gmatch('%S+') do words[#words + 1] = w end
+local rows, matched = {}, 0
+for p = 0, reaper.TrackFX_GetNumParams(track, index) - 1 do
+  local _, name = reaper.TrackFX_GetParamName(track, index, p, '')
+  local lowered, all = name:lower(), true
+  for _, w in ipairs(words) do if not lowered:find(w, 1, true) then all = false; break end end
+  if all and name:find('%S') then
+    matched = matched + 1
+    if matched > args.offset and #rows < args.limit then rows[#rows + 1] = fx.param_row(track, index, p, args.choices) end
+  end
+end
+local result = {track = track_name, fx = fx.describe(track, index), parameters = rows, matched = matched,
+  next_offset = matched > args.offset + #rows and args.offset + #rows or nil}
+local _, preset = reaper.TrackFX_GetPreset(track, index, '')
+result.fx.preset = preset
+if args.pins then result.input_pins = fx.pins(track, index) end
+return result
+'''
+
+
+@mcp.tool(annotations=READ, structured_output=False)
+async def fx_parameters(
+        track: TrackRef, fx: FxRef,
+        query: Annotated[str, Field(description='Words that must all appear in the parameter name.', max_length=200)] = '',
+        offset: Annotated[int, Field(ge=0)] = 0,
+        limit: Annotated[int, Field(ge=1, le=200)] = 60,
+        choices: Annotated[bool, Field(description='List the settings of switch/list parameters.')] = True,
+        pins: Annotated[bool, Field(description='Also list input pins (names, channels read), for sidechains.')] = False) -> str:
+    """Read a plugin's parameters as the plugin shows them: index, name, normalized value (0..1), displayed
+    value, display range, and the settings of switch/list parameters. Only parameters the plugin exposes to
+    the host are visible; controls that exist only in its window (some macros, mod matrices) are not."""
+    try:
+        code = fx_program(FX_PARAMETERS, track=track, fx=fx, query=query, offset=offset, limit=limit,
+                          choices=choices, pins=pins)
+        result = await read_query(code, 'Read FX parameters')
+        for row in result.get('parameters') or []:
+            empty_lists(row, 'choices')
+        return output(empty_lists(result, 'parameters', 'input_pins'), 'fx_parameters')
+    except Exception as error:
+        return output({'ok': False, 'error': str(error)}, 'fx_parameters')
+
+
+SET_FX_PARAMETERS = '''
+local track, track_name = fx.track(args.track)
+local index = fx.find(track, args.fx)
+local results, failed = {}, 0
+for _, change in ipairs(args.changes) do
+  local row = {param = change.param, requested = change.value}
+  local ok, err = pcall(function()
+    local p = fx.param_index(track, index, change.param)
+    local _, name = reaper.TrackFX_GetParamName(track, index, p, '')
+    local _, before = reaper.TrackFX_GetFormattedParamValue(track, index, p, '')
+    local value, note = fx.resolve(track, index, p, change.value, change.normalized)
+    reaper.TrackFX_SetParamNormalized(track, index, p, value)
+    local _, after = reaper.TrackFX_GetFormattedParamValue(track, index, p, '')
+    row.param, row.name, row.before, row.after, row.note = p, name, before, after, note
+    row.value = math.floor(reaper.TrackFX_GetParamNormalized(track, index, p) * 1e6 + 0.5) / 1e6
+  end)
+  if not ok then row.error = tostring(err); failed = failed + 1 end
+  results[#results + 1] = row
+end
+return {track = track_name, fx = fx.describe(track, index), results = results, failed = failed}
+'''
+
+
+class FxChange(BaseModel):
+    param: int | str = Field(description='Parameter index or name (from fx_parameters).')
+    value: str | float = Field(description='Target as the plugin displays it: "130 Hz", "1.2 kHz", "-18 dB", '
+                                           '"4:1", "35 %", "Spectral", "On". A number means the same in the '
+                                           "parameter's display unit, unless normalized is true.")
+    normalized: bool = Field(False, description='value is the raw 0..1 position instead of a display value.')
+
+
+@mcp.tool(annotations=FX_WRITE, structured_output=False)
+async def set_fx_parameters(
+        track: TrackRef, fx: FxRef,
+        changes: Annotated[list[FxChange], Field(min_length=1, max_length=64)]) -> str:
+    """Set plugin parameters to display values ("130 Hz", "-18 dB", "Spectral") and read them back. The
+    server finds the 0..1 position that makes the plugin show the requested value, so you never guess
+    normalized numbers. Each change reports before/after as displayed; a value outside the range is set to
+    the closest reachable one and says so. All changes are one Undo step. Check after against what you asked."""
+    try:
+        payload = [change.model_dump() for change in changes]
+        result = await fx_write(SET_FX_PARAMETERS, 'Set FX parameters', track=track, fx=fx, changes=payload)
+        if result.get('ok') and result.get('failed'):
+            result['ok'] = False
+            result['error'] = f"{result['failed']} change(s) failed; the others were applied (see results)."
+        return output(empty_lists(result, 'results'), 'set_fx_parameters')
+    except Exception as error:
+        return output({'ok': False, 'error': str(error)}, 'set_fx_parameters')
+
+
+EDIT_FX = '''
+local track, track_name = fx.track(args.track)
+local index = fx.find(track, args.fx)
+local before = fx.describe(track, index)
+local action = args.action
+if action == 'bypass' then reaper.TrackFX_SetEnabled(track, index, false)
+elseif action == 'enable' then reaper.TrackFX_SetEnabled(track, index, true)
+elseif action == 'offline' then reaper.TrackFX_SetOffline(track, index, true)
+elseif action == 'online' then reaper.TrackFX_SetOffline(track, index, false)
+elseif action == 'remove' then assert(reaper.TrackFX_Delete(track, index), 'REAPER refused to remove the FX')
+elseif action == 'move' then
+  assert(type(args.position) == 'number', 'move needs position')
+  local last = reaper.TrackFX_GetCount(track) - 1
+  assert(args.position >= 0 and args.position <= last, 'position must be 0..' .. last)
+  reaper.TrackFX_CopyToTrack(track, index, track, args.position, true)
+elseif action == 'show' then reaper.TrackFX_Show(track, index, 3)
+else error('Unknown action ' .. tostring(action), 0) end
+return {track = track_name, action = action, fx = before, chain = fx.chain(track)}
+'''
+
+
+@mcp.tool(annotations=FX_WRITE, structured_output=False)
+async def edit_fx(
+        track: TrackRef, fx: FxRef,
+        action: Annotated[Literal['bypass', 'enable', 'offline', 'online', 'remove', 'move', 'show'], Field(
+            description='bypass/enable switch processing; offline/online unload or reload the plugin; remove '
+                        'deletes it; move puts it at position; show opens its window for the user.')],
+        position: Annotated[int | None, Field(ge=0, description='For move: zero-based target position.')] = None) -> str:
+    """Bypass, enable, take offline, remove, move or show a plugin in a track's (or the master's) FX chain.
+    One Undo step. Returns the chain afterwards."""
+    try:
+        return output(await fx_write(EDIT_FX, f'FX {action}', track=track, fx=fx, action=action, position=position),
+                      'edit_fx')
+    except Exception as error:
+        return output({'ok': False, 'error': str(error)}, 'edit_fx')
+
+
+SIDECHAIN_SEND = '''
+local source, source_name = fx.track(args.source)
+local target, target_name = fx.track(args.target)
+assert(source ~= target, 'source and target must be different tracks')
+local send, reused = nil, false
+for s = 0, reaper.GetTrackNumSends(source, 0) - 1 do
+  if reaper.GetTrackSendInfo_Value(source, 0, s, 'P_DESTTRACK') == target then
+    local audio = reaper.GetTrackSendInfo_Value(source, 0, s, 'I_SRCCHAN')
+    local dst = reaper.GetTrackSendInfo_Value(source, 0, s, 'I_DSTCHAN')
+    if (args.kind == 'midi' and audio == -1) or (args.kind == 'audio' and audio ~= -1 and dst == args.channels - 1) then
+      send, reused = s, true
+    end
+  end
+end
+send = send or reaper.CreateTrackSend(source, target)
+assert(send >= 0, 'REAPER could not create the send')
+local result = {source = source_name, target = target_name, kind = args.kind, send_index = send, reused_existing_send = reused}
+if args.kind == 'audio' then
+  local needed = args.channels + 1
+  if reaper.GetMediaTrackInfo_Value(target, 'I_NCHAN') < needed then
+    reaper.SetMediaTrackInfo_Value(target, 'I_NCHAN', needed + needed % 2)
+  end
+  reaper.SetTrackSendInfo_Value(source, 0, send, 'I_SRCCHAN', 0)
+  reaper.SetTrackSendInfo_Value(source, 0, send, 'I_DSTCHAN', args.channels - 1)
+  reaper.SetTrackSendInfo_Value(source, 0, send, 'I_MIDIFLAGS', 31)
+  result.target_channels = {args.channels, args.channels + 1}
+  result.target_track_channels = reaper.GetMediaTrackInfo_Value(target, 'I_NCHAN')
+  if args.fx ~= nil then
+    local index = fx.find(target, args.fx)
+    local pins = fx.pins(target, index)
+    local side = {}
+    for _, pin in ipairs(pins) do
+      local name = (pin.name or ''):lower()
+      if name:find('side') or name:find('key') or name:find('aux') or name:find('sc ') or name:find('^sc') then side[#side + 1] = pin.pin end
+    end
+    if #side == 0 and #pins >= 4 then side = {3, 4} end
+    assert(#side >= 1, 'This plugin has no sidechain input pins (it shows ' .. #pins .. ' inputs)')
+    for i = 1, math.min(#side, 2) do
+      reaper.TrackFX_SetPinMappings(target, index, 0, side[i] - 1, 1 << (args.channels - 1 + i - 1), 0)
+    end
+    result.fx = fx.describe(target, index)
+    result.pins_before = pins
+    result.pins_after = fx.pins(target, index)
+  end
+else
+  reaper.SetTrackSendInfo_Value(source, 0, send, 'I_SRCCHAN', -1)
+  reaper.SetTrackSendInfo_Value(source, 0, send, 'I_MIDIFLAGS', args.midi_bus << 22)
+  result.midi_bus = args.midi_bus
+end
+result.send_volume = reaper.GetTrackSendInfo_Value(source, 0, send, 'D_VOL')
+return result
+'''
+
+
+@mcp.tool(annotations=FX_WRITE, structured_output=False)
+async def sidechain_send(
+        source: TrackRef, target: TrackRef,
+        kind: Annotated[Literal['audio', 'midi'], Field(
+            description='audio: the source\'s sound into extra channels of the target (for a compressor/ducker '
+                        'key input). midi: the source\'s notes only, for plugins triggered by MIDI.')],
+        channels: Annotated[int, Field(ge=3, le=63, description='audio: first target channel of the pair '
+                                                                '(3 = channels 3/4).')] = 3,
+        midi_bus: Annotated[int, Field(ge=1, le=16, description='midi: destination MIDI bus. Use 2+ when the target '
+                                                                'also has an instrument or its own notes.')] = 1,
+        fx: Annotated[str | int | None, Field(description='audio: the plugin on the target whose sidechain input '
+                                                          'pins should read those channels.')] = None) -> str:
+    """Create (or reuse) a send for sidechaining. audio: sends the source to channels N/N+1 of the target,
+    widens the target track if needed and, with fx, connects the plugin's sidechain input pins to them. midi:
+    a MIDI-only send to a MIDI bus. A plugin's MIDI input bus cannot be set by script: if midi_bus > 1, ask the
+    user to choose it in the plugin's pin connector (I/O > MIDI input > Bus N). Then switch the plugin's own
+    sidechain/trigger setting with set_fx_parameters. One Undo step."""
+    try:
+        result = await fx_write(SIDECHAIN_SEND, f'Sidechain {kind} send', source=source, target=target, kind=kind,
+                                channels=channels, midi_bus=midi_bus, fx=fx)
+        if result.get('ok') and kind == 'midi' and midi_bus > 1:
+            result['user_step'] = (f'In the target plugin window: pin connector (the "2 in 2 out" button) > I/O > '
+                                   f'MIDI input > Bus {midi_bus}. REAPER has no script API for this.')
+        return output(empty_lists(result, 'pins_before', 'pins_after'), 'sidechain_send')
+    except Exception as error:
+        return output({'ok': False, 'error': str(error)}, 'sidechain_send')
 
 
 # ----------------------------------------------------------------- audio

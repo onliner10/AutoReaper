@@ -20,7 +20,7 @@ from filelock import FileLock
 LUA = Path(__file__).with_name('lua')
 BRIDGE_SCRIPT_NAME = 'AutoReaper Bridge.lua'
 # The bridge protocol this server speaks; the heartbeat reports the script's.
-PROTOCOL = 2
+PROTOCOL = 3
 STALE_SECONDS = 5
 
 
@@ -128,6 +128,26 @@ class ReaperBridge:
                 time.sleep(.04)
             raise BridgeError(f'Request {request_id} timed out; outcome unknown. Do not replay it. '
                               f'read_receipt with request_id={request_id} shows the result once it finishes.')
+
+    def reload(self, timeout=5.0):
+        """Ask the running bridge to reload its script file; the new session's status, or None."""
+        try:
+            before = self.status()['session']
+        except BridgeError:
+            return None
+        (self.directory / 'reload.request').write_text('reload', encoding='utf-8')
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            time.sleep(.1)
+            try:
+                status = self.status()
+            except BridgeError:
+                continue
+            if status['session'] != before:
+                return status
+        (self.directory / 'reload.request').unlink(missing_ok=True)
+        raise BridgeError('The running bridge did not reload (an older version cannot). In REAPER run the '
+                          'AutoReaper Bridge action again and choose "New instance".')
 
     def receipt(self, request_id):
         if not request_id.isalnum():

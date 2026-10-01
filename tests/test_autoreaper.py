@@ -60,10 +60,10 @@ def test_server_lists_its_tools_with_read_only_hints():
     tools = {tool.name: tool for tool in asyncio.run(server.mcp.list_tools())}
     assert set(tools) == {'reaper_status', 'install_bridge', 'inspect_project', 'inspect_signal_flow',
                           'search_installed_fx', 'reaper_eval', 'read_receipt', 'reaper_eval_write',
-                          'capture'}
+                          'capture', 'add_fx', 'fx_parameters', 'set_fx_parameters', 'edit_fx', 'sidechain_send'}
     read_only = {name for name, tool in tools.items() if tool.annotations and tool.annotations.readOnlyHint}
     assert read_only == {'reaper_status', 'inspect_project', 'inspect_signal_flow', 'search_installed_fx',
-                         'reaper_eval', 'read_receipt'}
+                         'reaper_eval', 'read_receipt', 'fx_parameters'}
     assert tools['reaper_eval_write'].annotations.destructiveHint is True
 
 

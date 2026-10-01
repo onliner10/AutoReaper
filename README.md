@@ -15,13 +15,18 @@ It has two parts:
 | Tool | What it does |
 |---|---|
 | `reaper_status` | Whether REAPER and the bridge are running; REAPER version, open project |
-| `install_bridge` | Copies the bridge script into REAPER's `Scripts` folder |
+| `install_bridge` | Copies the bridge script into REAPER's `Scripts` folder; a running bridge reloads it |
 | `inspect_project` | Tracks (GUIDs, volume, pan, mute/solo, folders), FX, items, markers, tempo |
 | `inspect_signal_flow` | Folder tree, sends, sidechains, sources, master FX |
 | `search_installed_fx` | Installed plugin names, without loading any |
 | `reaper_eval` | Read-only ReaScript Lua in a sandbox (getters only) |
 | `reaper_eval_write` | ReaScript Lua that changes the project: one Undo step, project backed up first |
 | `read_receipt` | The result of a request that timed out, without running it again |
+| `add_fx` | Adds a plugin by name or words from it; lists candidates when several match |
+| `fx_parameters` | A plugin's parameters as it displays them, with ranges, list options and input pins |
+| `set_fx_parameters` | Sets parameters by display value ("130 Hz", "-18 dB", "Spectral") and reads them back |
+| `edit_fx` | Bypass, enable, offline, remove, move or show a plugin |
+| `sidechain_send` | Audio sidechain (send, track channels, plugin pins) or MIDI trigger send on a MIDI bus |
 | `capture` | Renders a bar or time range (full mix or soloed tracks) offline to a WAV |
 
 A `reaper` skill tells Claude how to use them: inspect first, measure before and after, and edit
@@ -85,9 +90,10 @@ Pillow for the script on first use), so the server itself stays small.
 
 ### Updating
 
-`/plugin update autoreaper@autoreaper`, then run `install_bridge` again and run the bridge action
-in REAPER once more. REAPER asks whether to terminate the running script or launch a new
-instance: choose **New instance** (the newest copy takes over and the old one stops itself).
+`/plugin update autoreaper@autoreaper`, restart Claude Code, then ask Claude to run `install_bridge`:
+it copies the new bridge script and the running bridge reloads it by itself. Bridges from 0.1.x cannot
+reload; for those, run the bridge action in REAPER again once and, when REAPER asks whether to
+terminate the running script or launch a new instance, choose **New instance**.
 
 ## Safety
 

@@ -54,6 +54,11 @@ local function project_id()
 end
 local session = reaper.genGuid()
 local last_heartbeat = 0
+-- Bumped when the request/receipt contract changes; the server warns on a mismatch.
+local PROTOCOL = 3
+-- This file, so install_bridge can ask the running bridge to reload it in place
+-- (running the action again would make REAPER ask about a second instance).
+local script_path = debug.getinfo(1, 'S').source:match('^@(.+)$')
 -- Id of the claimed request, so an unexpected error still leaves a receipt
 -- instead of the caller waiting out its whole timeout.
 local current = nil
@@ -72,7 +77,7 @@ local function owns_mailbox()
 end
 local function step()
   if reaper.time_precise()-last_heartbeat > .5 then
-    write('heartbeat.json', {session=session, timestamp=os.time(), project_id=project_id(), version=reaper.GetAppVersion(), protocol=2})
+    write('heartbeat.json', {session=session, timestamp=os.time(), project_id=project_id(), version=reaper.GetAppVersion(), protocol=PROTOCOL})
     last_heartbeat=reaper.time_precise()
   end
   local f=io.open(path('request.lua'),'rb')
@@ -123,15 +128,28 @@ local function step()
               result.partial_change_possible=false
             else
               local before=reaper.GetProjectStateChangeCount(proj)
+              local undo_before=req.mutate and reaper.Undo_CanUndo2(proj) or nil
               local undo_started=false
               if req.mutate then reaper.Undo_BeginBlock2(proj); undo_started=true end
               debug.sethook(function() if reaper.time_precise()>deadline then error('Lua CPU deadline exceeded') end end,'',100000)
               local ok,value=xpcall(fn,debug.traceback)
               debug.sethook()
-              -- Read the count before closing the Undo block: Undo_EndBlock2
-              -- bumps it even when the code changed nothing.
-              result.changed=reaper.GetProjectStateChangeCount(proj)~=before
-              if req.mutate then reaper.Undo_EndBlock2(proj,req.label,-1); reaper.UpdateArrange() end
+              -- Neither change count alone tells whether the code changed the
+              -- project: Undo_EndBlock2 bumps it even for no change, and FX edits
+              -- only count once the block closes. REAPER adds an undo point only
+              -- when something changed, so a new top entry with our label is the
+              -- signal. If the previous entry had the same label, and nothing
+              -- counted before closing, the answer is unknown (nil).
+              local counted=reaper.GetProjectStateChangeCount(proj)~=before
+              result.changed=counted
+              if req.mutate then
+                reaper.Undo_EndBlock2(proj,req.label,-1); reaper.UpdateArrange()
+                local top=reaper.Undo_CanUndo2(proj)
+                if not counted then
+                  if top==req.label and undo_before~=req.label then result.changed=true
+                  elseif top==req.label then result.changed=nil end
+                end
+              end
               result.ok=ok
               result.undo_label=req.mutate and req.label or nil
               if ok then
@@ -145,7 +163,7 @@ local function step()
             end
           end
         end
-        pcall(write,'heartbeat.json',{session=session,timestamp=os.time(),project_id=project_id(),version=reaper.GetAppVersion(),protocol=2})
+        pcall(write,'heartbeat.json',{session=session,timestamp=os.time(),project_id=project_id(),version=reaper.GetAppVersion(),protocol=PROTOCOL})
         if not pcall(write,req.id..'.json',result) then
           -- The request itself ran to completion; only its return value was
           -- not JSON. Report the real outcome without that payload so a
@@ -175,8 +193,20 @@ local function report(err)
   local f=io.open(path('bridge-errors.log'),'ab')
   if f then f:write(os.date('%Y-%m-%d %H:%M:%S ')..tostring(err)..'\n'); f:close() end
 end
+local function reload_requested()
+  local f=io.open(path('reload.request'),'rb')
+  if not f then return false end
+  f:close(); os.remove(path('reload.request'))
+  return script_path~=nil
+end
 local function loop()
   if not owns_mailbox() then return end
+  if reload_requested() then
+    -- The new code claims the mailbox and starts its own loop; this one stops.
+    local ok, err = pcall(dofile, script_path)
+    if ok then return end
+    pcall(report, 'reload failed: '..tostring(err))
+  end
   local ok, err = pcall(step)
   if not ok then
     pcall(report, err)

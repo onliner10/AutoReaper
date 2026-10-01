@@ -40,6 +40,7 @@ class FakeReaper:
         reaper.CountTracks = lambda *_: 3
         reaper.SetMediaTrackInfo_Value = lambda *_: state.__setitem__('changes', state['changes'] + 1)
         reaper.Undo_BeginBlock2 = reaper.Undo_EndBlock2 = reaper.UpdateArrange = lambda *_: None
+        reaper.Undo_CanUndo2 = lambda *_: None
         reaper.atexit = lambda *_: None
         reaper.defer = lambda fn: state.__setitem__('deferred', fn)
         lua.globals().reaper = reaper
