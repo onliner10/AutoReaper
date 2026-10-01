@@ -1,0 +1,12 @@
+{
+  "name": "autoreaper",
+  "version": "0.1.0",
+  "description": "Work in your open REAPER project from Claude Code: inspect tracks, FX, MIDI and routing, edit with ReaScript (one undo step, backed up), and render ranges to measure levels and spectra.",
+  "author": {
+    "name": "Mateusz Urban"
+  },
+  "homepage": "https://github.com/onliner10/AutoReaper",
+  "repository": "https://github.com/onliner10/AutoReaper",
+  "license": "MIT",
+  "keywords": ["reaper", "daw", "mixing", "music-production", "audio", "reascript"]
+}

@@ -1,0 +1,16 @@
+{
+  "name": "autoreaper",
+  "owner": {
+    "name": "Mateusz Urban"
+  },
+  "metadata": {
+    "description": "AutoReaper: REAPER tools for Claude Code."
+  },
+  "plugins": [
+    {
+      "name": "autoreaper",
+      "source": "./",
+      "description": "Inspect, edit, render and measure your open REAPER project from Claude Code."
+    }
+  ]
+}
