@@ -86,7 +86,8 @@ Pillow for the script on first use), so the server itself stays small.
 ### Updating
 
 `/plugin update autoreaper@autoreaper`, then run `install_bridge` again and run the bridge action
-in REAPER once more (the newest running copy takes over).
+in REAPER once more. REAPER asks whether to terminate the running script or launch a new
+instance: choose **New instance** (the newest copy takes over and the old one stops itself).
 
 ## Safety
 

@@ -175,7 +175,8 @@ async def install_bridge(
     return output({'ok': True, 'installed': str(path), 'mailbox': str(bridge.directory),
                    'next': f'In REAPER: Actions > Show action list > New action > Load ReaScript, choose '
                            f'"{BRIDGE_SCRIPT_NAME}", then Run. If an older copy is already running, run it '
-                           'again: the newest instance takes over. Then call reaper_status.',
+                           'again and answer REAPER\'s question with "New instance": the newest copy takes over. '
+                           'Then call reaper_status.',
                    'autostart': 'Optional: add the line  dofile(reaper.GetResourcePath().."/Scripts/'
                                 + BRIDGE_SCRIPT_NAME + '")  to Scripts/__startup.lua.'}, 'install')
 
@@ -293,7 +294,9 @@ async def reaper_eval_write(
         backups.mkdir(parents=True, exist_ok=True)
         prune_backups(backups)
         destination = backups / ('backup-' + time.strftime('%Y%m%d-%H%M%S') + '-' + uuid4().hex[:6] + '.rpp')
-        receipt = await bridge.evaluate(backup_code(destination) + code, project_id=project_id, label=label)
+        # The backup runs as the preflight: before the change count is taken and
+        # the Undo block opens, and a failed backup blocks the edit.
+        receipt = await bridge.evaluate(code, project_id=project_id, label=label, preflight=backup_code(destination))
         if destination.is_file():
             receipt['backup'] = {'path': str(destination), 'media_copied': False}
         return output(receipt, 'reaper_eval_write')

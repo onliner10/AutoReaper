@@ -100,9 +100,9 @@ local function step()
             debug.sethook()
             return ok,value
           end
-          -- A caller may supply a side-effect-free validation program. It runs
-          -- before loading/starting the mutating request, so rejected FX
-          -- gestures do not open an empty Undo block or look partially applied.
+          -- A caller may supply a preflight program (the server uses it for the
+          -- project backup). It runs before the change count is taken and the
+          -- Undo block opens; if it fails, the request is not run at all.
           local preflight_ok,preflight_value=true,nil
           if type(req.preflight)=='string' and req.preflight~='' then
             preflight_ok,preflight_value=run(req.preflight,'AutoReaper preflight')
@@ -128,9 +128,11 @@ local function step()
               debug.sethook(function() if reaper.time_precise()>deadline then error('Lua CPU deadline exceeded') end end,'',100000)
               local ok,value=xpcall(fn,debug.traceback)
               debug.sethook()
+              -- Read the count before closing the Undo block: Undo_EndBlock2
+              -- bumps it even when the code changed nothing.
+              result.changed=reaper.GetProjectStateChangeCount(proj)~=before
               if req.mutate then reaper.Undo_EndBlock2(proj,req.label,-1); reaper.UpdateArrange() end
               result.ok=ok
-              result.changed=reaper.GetProjectStateChangeCount(proj)~=before
               result.undo_label=req.mutate and req.label or nil
               if ok then
                 result.result=value
