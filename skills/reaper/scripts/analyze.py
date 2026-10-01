@@ -1,16 +1,28 @@
-"""Measurements and spectrogram images for captures.
+# /// script
+# requires-python = ">=3.10"
+# dependencies = ["numpy>=1.26", "soundfile>=0.12", "Pillow>=10"]
+# ///
+"""Measure a WAV from AutoReaper's capture: levels, per-bar band table, before/after differences
+and an optional spectrogram image.
 
-Pure numpy + Pillow (+ soundfile for reading), no REAPER, so tests run
-without it. Levels are dBFS of the original float
-samples; a full-scale sine reads 0 dB on the spectrogram and -3 dB RMS in the
-table.
+    uv run --script analyze.py WAV [--compare BEFORE_WAV] [--spectrogram] [options]
+
+Prints one JSON line (levels, bar grid source, files written), then text tables:
+- per-bar band energy (sub 20-60 Hz ... air 10-20 kHz, dBFS), total RMS, spectral centroid, side/mid;
+- with --compare: the same table for WAV minus BEFORE_WAV, bar by bar (positive = louder in WAV).
+The bar grid comes from the capture's .json sidecar (or --bar-grid). Levels are dBFS of the
+original float samples: a full-scale sine reads -3 dB RMS in the table and 0 dB on the spectrogram.
 """
 from __future__ import annotations
 
+import argparse
+import json
 import math
+import sys
 from pathlib import Path
 
 import numpy as np
+from PIL import Image, ImageDraw, ImageFont
 
 BANDS = (('sub', 20, 60), ('low', 60, 150), ('lowmid', 150, 500), ('mid', 500, 2000),
          ('highmid', 2000, 5000), ('high', 5000, 10000), ('air', 10000, 20000))
@@ -247,7 +259,6 @@ def time_marks(bar_grid, wav_start_seconds, duration_seconds):
 
 
 def _font(size, bold=False):
-    from PIL import ImageFont
     for name in (('arialbd.ttf' if bold else 'arial.ttf'), 'DejaVuSans.ttf'):
         try:
             return ImageFont.truetype(name, size)
@@ -263,7 +274,6 @@ def _tick_label(freq):
 def render_spectrogram(samples, sample_rate, path, *, title, bar_grid=None, wav_start_seconds=0.0,
                        panels=('full', 'lowband'), dynamic_range_db=80.0, top_dbfs=None, width=1600):
     """Write a PNG with one row per panel; returns a receipt with the dB scale used."""
-    from PIL import Image, ImageDraw
     stereo = as_stereo(samples)
     mid, side = mid_side(stereo)
     duration = len(stereo) / sample_rate
@@ -346,3 +356,120 @@ def render_spectrogram(samples, sample_rate, path, *, title, bar_grid=None, wav_
                          'reference': 'Hann-windowed STFT magnitude, full-scale sine = 0 dBFS; mid = (L+R)/2'},
             'fft_sizes': {name: spec[name][4] for name in panels},
             'x_axis': axis}
+
+
+# ---------------------------------------------------------------- command line
+
+DIFF_COLUMNS = ('sub', 'low', 'lowmid', 'mid', 'highmid', 'high', 'air', 'total', 'side_mid_db')
+
+
+def load(wav, bar_grid=None, wav_start_seconds=None):
+    """(samples, sample_rate, grid, wav_start_seconds, sidecar) of a WAV and its capture sidecar."""
+    import soundfile
+    path = Path(wav)
+    samples, sample_rate = soundfile.read(str(path), dtype='float64', always_2d=True)
+    sidecar_path = path.with_suffix('.json')
+    sidecar = json.loads(sidecar_path.read_text(encoding='utf-8')) if sidecar_path.exists() else {}
+    start = float(wav_start_seconds if wav_start_seconds is not None else sidecar.get('wav_start_seconds', 0.0))
+    grid = normalize_bar_grid(bar_grid if bar_grid is not None else sidecar.get('bar_grid'),
+                              len(samples) / sample_rate, start)
+    return samples, sample_rate, grid, start, sidecar
+
+
+def difference_rows(after, before):
+    """after - before per band, for the bars both tables contain (matched by bar number)."""
+    earlier = {row['bar']: row for row in before}
+    rows = []
+    for row in after:
+        if row['bar'] in earlier:
+            old = earlier[row['bar']]
+            rows.append({'bar': row['bar'], **{k: round(row[k] - old[k], 1) for k in DIFF_COLUMNS},
+                         'centroid_hz': row['centroid_hz'] - old['centroid_hz']})
+    return rows
+
+
+def format_difference_table(rows):
+    header = 'bar   sub20-60 low60-150 lm150-500 mid.5-2k hm2-5k hi5-10k air10-20k | totalRMS centroid S/M'
+    lines = ['# difference in dB, WAV minus --compare (positive = more energy in WAV); centroid in Hz', header]
+    for row in rows:
+        bands = ' '.join(f"{row[name]:>+{width}.1f}" for name, width in zip(
+            ('sub', 'low', 'lowmid', 'mid', 'highmid', 'high', 'air'), (8, 9, 9, 8, 6, 7, 9)))
+        lines.append(f"{str(row['bar']):<5} {bands} | {row['total']:>+8.1f} {row['centroid_hz']:>+8d} "
+                     f"{row['side_mid_db']:>+5.1f}")
+    return '\n'.join(lines)
+
+
+def spectrogram_title(wav, grid, duration, sidecar):
+    span = f'bars {grid[0]["bar"]}-{grid[-1]["bar"]} ({len(grid)} bars)' if grid else f'{duration:.2f} s'
+    rng = sidecar.get('range') or {}
+    when = f", project {rng['start_seconds']:.2f}-{rng['end_seconds']:.2f} s" if 'start_seconds' in rng else ''
+    isolated = ', '.join(t.get('track', '') for t in sidecar.get('isolated_tracks') or [])
+    return f'{Path(wav).stem}: {span}{when}' + (f' | solo: {isolated}' if isolated else '')
+
+
+def parse_args(argv):
+    parser = argparse.ArgumentParser(description=__doc__.split('\n\n')[0])
+    parser.add_argument('wav')
+    parser.add_argument('--compare', metavar='BEFORE_WAV', help='print WAV minus this WAV, bar by bar')
+    parser.add_argument('--spectrogram', action='store_true', help='also write a PNG next to the WAV')
+    parser.add_argument('--panels', default='full,lowband', help='comma list of full, lowband, side')
+    parser.add_argument('--top-dbfs', type=float, help='fixed top of the colour scale, so two images compare')
+    parser.add_argument('--dynamic-range-db', type=float, default=80.0)
+    parser.add_argument('--bar-grid', help='JSON {bar: start_seconds} when the WAV has no sidecar')
+    parser.add_argument('--wav-start', type=float, help='project time of the first sample, with --bar-grid')
+    parser.add_argument('--no-table', action='store_true', help='skip the per-bar table')
+    args = parser.parse_args(argv)
+    args.panels = tuple(p.strip() for p in args.panels.split(',') if p.strip())
+    if not args.panels or any(p not in ('full', 'lowband', 'side') for p in args.panels) \
+            or len(set(args.panels)) != len(args.panels):
+        parser.error('--panels takes a comma list of full, lowband, side')
+    if not 20 <= args.dynamic_range_db <= 160:
+        parser.error('--dynamic-range-db must be in 20..160')
+    if args.top_dbfs is not None and not -120 <= args.top_dbfs <= 30:
+        parser.error('--top-dbfs must be in -120..30')
+    args.bar_grid = json.loads(args.bar_grid) if args.bar_grid else None
+    return args
+
+
+def main(argv=None):
+    args = parse_args(sys.argv[1:] if argv is None else argv)
+    for stream in (sys.stdout, sys.stderr):
+        stream.reconfigure(encoding='utf-8')
+    samples, sample_rate, grid, start, sidecar = load(args.wav, args.bar_grid, args.wav_start)
+    duration = len(samples) / sample_rate
+    summary = {'ok': True, 'wav': str(Path(args.wav)), 'duration_seconds': round(duration, 6),
+               'sample_rate': sample_rate, 'levels': levels(samples),
+               **{k: sidecar[k] for k in ('range', 'scope', 'isolated_tracks', 'tempo_bpm', 'meter') if k in sidecar},
+               'bar_grid_source': 'arguments' if args.bar_grid is not None else
+               ('sidecar' if sidecar.get('bar_grid') else 'none')}
+    tables = []
+    rows = bar_table(samples, sample_rate, grid, start) if grid else []
+    if not args.no_table:
+        tables.append(format_table(rows) if grid else '# no bar grid, so no per-bar table')
+    if args.compare:
+        before, before_rate, before_grid, before_start, _ = load(args.compare)
+        summary['compare'] = {'wav': str(Path(args.compare)), 'levels': levels(before)}
+        summary['level_difference_db'] = {k: round(summary['levels'][k] - summary['compare']['levels'][k], 2)
+                                          for k in ('peak_dbfs', 'rms_dbfs')}
+        if grid and before_grid:
+            diff = difference_rows(rows, bar_table(before, before_rate, before_grid, before_start))
+            summary['compared_bars'] = len(diff)
+        else:
+            # Without a bar grid on both sides, compare the whole recordings.
+            diff = difference_rows([{'bar': 'all', **segment_row(samples, sample_rate)}],
+                                   [{'bar': 'all', **segment_row(before, before_rate)}])
+        tables.append(format_difference_table(diff))
+    if args.spectrogram:
+        png = Path(args.wav).with_name(Path(args.wav).stem + '-' + '-'.join(args.panels) + '.png')
+        summary['spectrogram'] = render_spectrogram(
+            samples, sample_rate, png, title=spectrogram_title(args.wav, grid, duration, sidecar), bar_grid=grid,
+            wav_start_seconds=start, panels=args.panels, dynamic_range_db=args.dynamic_range_db,
+            top_dbfs=args.top_dbfs)
+    print(json.dumps(summary, ensure_ascii=False))
+    for table in tables:
+        print(table)
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

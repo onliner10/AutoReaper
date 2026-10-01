@@ -12,16 +12,14 @@ requires-python = ">=3.10"
 dependencies = [
     "mcp>=1.9,<2",
     "filelock>=3.16,<4",
-    "numpy>=1.26,<3",
-    "Pillow>=10,<13",
-    "soundfile>=0.12,<1",
 ]
 
 [project.scripts]
 autoreaper = "autoreaper.__main__:main"
 
 [dependency-groups]
-dev = ["pytest>=8", "lupa>=2"]
+# numpy, soundfile and Pillow are for the skill's analyze.py script, which uv runs on its own.
+dev = ["pytest>=8", "lupa>=2", "numpy>=1.26", "soundfile>=0.12", "Pillow>=10"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/autoreaper"]

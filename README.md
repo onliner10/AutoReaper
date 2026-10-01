@@ -22,20 +22,26 @@ It has two parts:
 | `reaper_eval` | Read-only ReaScript Lua in a sandbox (getters only) |
 | `reaper_eval_write` | ReaScript Lua that changes the project: one Undo step, project backed up first |
 | `read_receipt` | The result of a request that timed out, without running it again |
-| `capture` | Renders a bar or time range offline and measures it: peak/RMS, a per-bar band table, optional spectrogram image |
-| `spectrogram` | Spectrogram image and band table of a WAV, without rendering |
+| `capture` | Renders a bar or time range (full mix or soloed tracks) offline to a WAV |
 
 A `reaper` skill tells Claude how to use them: inspect first, measure before and after, and edit
-only what you asked for.
+only what you asked for. It includes `scripts/analyze.py`, which Claude runs on captured WAVs:
+
+- levels and a per-bar table of band energy (sub to air), RMS, spectral centroid and side/mid,
+- `--compare before.wav`: the per-bar difference in dB, for "did this change help?",
+- `--spectrogram`: a PNG with bar lines, for an overview. Conclusions come from the numbers.
+
+The analysis runs outside the MCP server (`uv run --script`, which installs numpy, soundfile and
+Pillow for the script on first use), so the server itself stays small.
 
 ## Requirements
 
 - REAPER 6 or 7 on Windows, macOS or Linux.
 - Claude Code.
 - [uv](https://docs.astral.sh/uv/getting-started/installation/). Claude Code starts the server
-  with `uv run`; on first start uv fetches Python 3.10+ if needed and installs the dependencies
-  (`mcp`, `numpy`, `Pillow`, `soundfile`, `filelock`) into the plugin folder, which can take a
-  minute.
+  with `uv run`; on first start uv fetches Python 3.10+ if needed and installs its two
+  dependencies (`mcp`, `filelock`) into the plugin folder. The analysis script's dependencies are
+  installed by uv the first time Claude runs it.
 
 ## Install
 
@@ -129,7 +135,7 @@ Set `AUTOREAPER_HOME` to move it. The bridge reads the same variable, so REAPER 
 uv run pytest
 ```
 
-The tests cover the audio measurements, argument checks and the bridge protocol, including the
+The tests cover the analysis script, argument checks and the bridge protocol, including the
 real `bridge.lua` and read-only sandbox running in Lua 5.4 against a fake REAPER API (through
 `lupa`). To try a working copy in Claude Code without installing it:
 

@@ -51,32 +51,32 @@ source = { editable = "." }
 dependencies = [
     { name = "filelock" },
     { name = "mcp" },
-    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
-    { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.11.*'" },
-    { name = "numpy", version = "2.5.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
-    { name = "pillow" },
-    { name = "soundfile" },
 ]
 
 [package.dev-dependencies]
 dev = [
     { name = "lupa" },
+    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.11.*'" },
+    { name = "numpy", version = "2.5.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
+    { name = "pillow" },
     { name = "pytest" },
+    { name = "soundfile" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "filelock", specifier = ">=3.16,<4" },
     { name = "mcp", specifier = ">=1.9,<2" },
-    { name = "numpy", specifier = ">=1.26,<3" },
-    { name = "pillow", specifier = ">=10,<13" },
-    { name = "soundfile", specifier = ">=0.12,<1" },
 ]
 
 [package.metadata.requires-dev]
 dev = [
     { name = "lupa", specifier = ">=2" },
+    { name = "numpy", specifier = ">=1.26" },
+    { name = "pillow", specifier = ">=10" },
     { name = "pytest", specifier = ">=8" },
+    { name = "soundfile", specifier = ">=0.12" },
 ]
 
 [[package]]

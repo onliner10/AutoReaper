@@ -2,7 +2,7 @@
   "mcpServers": {
     "autoreaper": {
       "command": "uv",
-      "args": ["run", "--quiet", "--project", "${CLAUDE_PLUGIN_ROOT}", "autoreaper"]
+      "args": ["run", "--quiet", "--no-dev", "--project", "${CLAUDE_PLUGIN_ROOT}", "autoreaper"]
     }
   }
 }

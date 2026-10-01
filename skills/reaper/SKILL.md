@@ -42,13 +42,29 @@ which runs inside REAPER and executes ReaScript sent by the server.
    Find a track by GUID by looping over `reaper.GetTrack(0, i)` and comparing
    `reaper.GetTrackGUID(track)`; SWS helpers such as `BR_GetMediaTrackByGUID` exist only when
    SWS is installed.
-3. **You cannot hear.** `capture` renders a range offline and returns peak/RMS and a per-bar
-   table (band energy sub..air, total RMS, centroid, side/mid). Add `"spectrogram": true` for an
-   image with bar lines; `spectrogram` redraws from a saved WAV, and a fixed `top_dbfs` makes two
-   images comparable. Base claims about the sound on these numbers, and say what they cannot
-   show (feel, groove, taste are the user's call).
+3. **You cannot hear, so measure.** `capture` renders a range offline (`start_bar`/`end_bar`,
+   end exclusive, bar 1 = first measure; optional `track_guids` to solo tracks) and returns the
+   WAV path; a `.json` sidecar beside it holds the bar grid. Measure it with this skill's script,
+   `scripts/analyze.py` relative to this skill's base directory, via Bash:
+
+   ```
+   uv run --script <skill dir>/scripts/analyze.py <wav>                  levels + per-bar band table
+   uv run --script <skill dir>/scripts/analyze.py <after.wav> --compare <before.wav>
+   uv run --script <skill dir>/scripts/analyze.py <wav> --spectrogram [--panels full,lowband,side] [--top-dbfs 0]
+   ```
+
+   The table gives, per bar, band energy in dBFS (sub 20-60, low 60-150, lowmid 150-500,
+   mid 500-2k, highmid 2-5k, high 5-10k, air 10-20k), total RMS, spectral centroid and side/mid.
+   `--compare` prints the per-bar difference in dB (positive = more in the first WAV).
+   `--spectrogram` writes a PNG next to the WAV; look at it with Read for an overview (where
+   things happen, buildups, transients), but take numbers from the tables, not from the colours.
+   Use the same `--top-dbfs` for two images you compare. For anything the script does not cover,
+   write your own Python on the WAV (e.g. `uv run --with numpy --with soundfile`).
+   Say what measurements cannot show: feel, groove and taste are the user's call.
 4. **Measure before and after.** When the user asks whether a change helped, capture the same
-   range with the same tracks before and after the edit and report both numbers.
+   range with the same tracks before and after the edit, run `--compare`, and report the numbers.
+   Renders of the same unchanged range can differ by about 0.1 dB (and more for random or
+   time-based effects), so do not read meaning into differences that small.
 5. **Edit only what the user asked for**, with `reaper_eval_write`, passing the fresh
    `project_id`. One call is one Undo step and the project file is backed up first (path in
    `backup`). Return a readback of what changed and check it. Batch related changes in one

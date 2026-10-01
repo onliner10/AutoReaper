@@ -1,13 +1,22 @@
 import asyncio
+import importlib.util
 import json
 import threading
 import time
+from pathlib import Path
 
 import numpy as np
 import pytest
 import soundfile
 
-from autoreaper import audio, bridge as bridge_module, server
+from autoreaper import bridge as bridge_module, server
+from autoreaper.wav import wav_info
+
+# The skill's measuring script, run by uv on its own, imported here as a module.
+_spec = importlib.util.spec_from_file_location(
+    'analyze', Path(__file__).parents[1] / 'skills' / 'reaper' / 'scripts' / 'analyze.py')
+audio = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(audio)
 
 SR = 48000
 
@@ -22,12 +31,7 @@ def test_capture_range_bars_seconds_and_rejections():
             server.capture_range(*bad)
 
 
-def test_spectrogram_options_and_track_guids():
-    assert server.spectrogram_options('side', 80, None) == (('side',), 80.0, None)
-    for bad in ((['top'], 80, None), ([], 80, None), (['full', 'full'], 80, None), (['full'], 5, None),
-                (['full'], 80, 99)):
-        with pytest.raises(ValueError):
-            server.spectrogram_options(*bad)
+def test_track_guids():
     guid = '{0A1B2C3D-0000-1111-2222-333344445555}'
     assert server.coerce_track_guids(json.dumps([guid])) == [guid]
     assert server.coerce_track_guids(guid) == [guid] and server.coerce_track_guids(None) == []
@@ -56,10 +60,10 @@ def test_server_lists_its_tools_with_read_only_hints():
     tools = {tool.name: tool for tool in asyncio.run(server.mcp.list_tools())}
     assert set(tools) == {'reaper_status', 'install_bridge', 'inspect_project', 'inspect_signal_flow',
                           'search_installed_fx', 'reaper_eval', 'read_receipt', 'reaper_eval_write',
-                          'capture', 'spectrogram'}
+                          'capture'}
     read_only = {name for name, tool in tools.items() if tool.annotations and tool.annotations.readOnlyHint}
     assert read_only == {'reaper_status', 'inspect_project', 'inspect_signal_flow', 'search_installed_fx',
-                         'reaper_eval', 'read_receipt', 'spectrogram'}
+                         'reaper_eval', 'read_receipt'}
     assert tools['reaper_eval_write'].annotations.destructiveHint is True
 
 
@@ -106,17 +110,45 @@ def test_bridge_round_trip_and_missing_bridge(tmp_path):
     assert not list(tmp_path.glob('*.json'))[1:]  # only the heartbeat is left
 
 
-def test_spectrogram_tool_reads_a_wav_and_returns_an_image(tmp_path):
+def write_capture(path, samples, start, bars):
+    """A WAV plus the sidecar capture writes: bar grid from {bar: start_seconds}."""
+    soundfile.write(str(path), samples, SR, subtype='FLOAT')
+    grid = audio.normalize_bar_grid(bars, len(samples) / SR, start)
+    path.with_suffix('.json').write_text(json.dumps({'wav_start_seconds': start, 'bar_grid': grid}))
+
+
+def test_wav_info_reads_float_wav_headers(tmp_path):
+    x = sine(1000, 1.5)
+    soundfile.write(str(tmp_path / 'f.wav'), np.stack([x, x], 1), SR, subtype='FLOAT')
+    info = wav_info(tmp_path / 'f.wav')
+    assert info['sample_rate'] == SR and info['channels'] == 2 and info['sample_format'] == 'FLOAT'
+    assert info['duration_seconds'] == pytest.approx(1.5)
+
+
+def test_analyze_prints_levels_table_difference_and_spectrogram(tmp_path, capsys):
     x = sine(1000, 1.0, 0.5)
-    wav = tmp_path / 'tone.wav'
-    soundfile.write(str(wav), np.stack([x, x], 1), SR, subtype='FLOAT')
-    parts = asyncio.run(server.spectrogram(str(wav), bar_grid={'1': 0.0, '2': 0.5}))
-    text, image = parts
-    lines = text.splitlines()
+    after, before = tmp_path / 'after.wav', tmp_path / 'before.wav'
+    write_capture(after, np.stack([x, x], 1), 10.0, {'5': 10.0, '6': 10.5})
+    write_capture(before, np.stack([x, x], 1) * 0.5, 10.0, {'5': 10.0, '6': 10.5})
+    assert audio.main([str(after), '--compare', str(before), '--spectrogram', '--panels', 'side']) == 0
+    lines = capsys.readouterr().out.splitlines()
     summary = json.loads(lines[0])
-    assert summary['ok'] and summary['bar_grid_source'] == 'arguments'
+    assert summary['bar_grid_source'] == 'sidecar' and summary['compared_bars'] == 2
     assert summary['levels']['peak_dbfs'] == pytest.approx(-6.02, abs=0.01)
-    assert lines[3].startswith('1 ') and lines[4].startswith('2 ') and image.path.exists()
+    assert summary['level_difference_db']['rms_dbfs'] == pytest.approx(6.02, abs=0.01)
+    assert lines[3].startswith('5 ') and lines[4].startswith('6 ')
+    diff = [line for line in lines if line.startswith('5 ')][1]
+    assert float(diff.split()[4]) == pytest.approx(6.0, abs=0.15)  # mid band 500-2000 Hz: twice the amplitude
+    assert Path(summary['spectrogram']['png']).exists()
+
+
+def test_analyze_without_bar_grid_compares_whole_files(tmp_path, capsys):
+    x = sine(100, 1.0, 0.5)
+    soundfile.write(str(tmp_path / 'a.wav'), np.stack([x, x], 1), SR, subtype='FLOAT')
+    soundfile.write(str(tmp_path / 'b.wav'), np.stack([x, x], 1), SR, subtype='FLOAT')
+    assert audio.main([str(tmp_path / 'a.wav'), '--compare', str(tmp_path / 'b.wav')]) == 0
+    out = capsys.readouterr().out
+    assert '# no bar grid' in out and any(line.startswith('all ') for line in out.splitlines())
 
 
 def test_normalize_bar_grid_from_map_and_list():

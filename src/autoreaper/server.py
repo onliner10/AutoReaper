@@ -7,16 +7,17 @@ import math
 import re
 import time
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import Annotated
 from uuid import uuid4
 
-from mcp.server.fastmcp import FastMCP, Image
+from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 from pydantic import Field
 
 from .bridge import (BRIDGE_SCRIPT_NAME, LUA, PROTOCOL, BridgeError, ReaperBridge, default_reaper_resource_path,
                      home_directory, install_bridge_script, lua_string)
 from .lua_calls import _referenced_reaper_apis
+from .wav import wav_info
 
 # Claude Code warns above ~25k tokens of tool output; larger results go to a
 # file that Read and Grep can page through.
@@ -24,14 +25,13 @@ MAX_INLINE_CHARS = 40000
 MAX_BACKUP_AGE_SECONDS = 3 * 24 * 60 * 60
 MAX_BACKUP_BYTES = 128 * 1024 * 1024
 MAX_CAPTURE_BARS = 512
-PANELS = ('full', 'lowband', 'side')
 _TRACK_GUID = re.compile(r'^\{?[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}\}?$')
 
 INSTRUCTIONS = """Tools for the user's open REAPER project, through the AutoReaper Bridge script running in REAPER.
 Start with reaper_status (if the bridge is missing, guide the user through install_bridge), then
 inspect_project. Read with reaper_eval (read-only Lua sandbox); change the project only when the user
-asked, with reaper_eval_write. You cannot hear: capture renders a range to WAV and measures it, with
-an optional spectrogram image. Measure before and after any change you claim helped."""
+asked, with reaper_eval_write. You cannot hear: capture renders a range to WAV; measure it with the
+reaper skill's analyze.py script. Measure before and after any change you claim helped."""
 
 mcp = FastMCP('autoreaper', instructions=INSTRUCTIONS, log_level='WARNING')
 bridge = ReaperBridge()
@@ -325,17 +325,6 @@ def capture_range(start_bar, end_bar, start_seconds, end_seconds):
     raise ValueError('give start_bar/end_bar or start_seconds/end_seconds')
 
 
-def spectrogram_options(panels, dynamic_range_db, top_dbfs):
-    panels = [panels] if isinstance(panels, str) else list(panels)
-    if not panels or any(p not in PANELS for p in panels) or len(set(panels)) != len(panels):
-        raise ValueError('panels must be a list from "full", "lowband", "side"')
-    if isinstance(dynamic_range_db, bool) or not 20 <= dynamic_range_db <= 160:
-        raise ValueError('dynamic_range_db must be a number in 20..160')
-    if top_dbfs is not None and (isinstance(top_dbfs, bool) or not -120 <= top_dbfs <= 30):
-        raise ValueError('top_dbfs must be a number in -120..30 (omit it for an automatic scale)')
-    return tuple(panels), float(dynamic_range_db), top_dbfs
-
-
 def summarize_grid(bar_grid):
     """Compact bar -> start seconds map plus the tempo/meter values the grid contains."""
     tempos = sorted({round(row['tempo'], 3) for row in bar_grid if 'tempo' in row})
@@ -356,7 +345,6 @@ async def bar_range(start_bar, end_bar):
 
 async def render(start_seconds, end_seconds, track_guids):
     """Offline-render master to a 48 kHz float WAV; REAPER's render settings and mute/solo are restored."""
-    import soundfile
     capture_id = uuid4().hex[:12]
     captures = home_directory() / 'captures'
     captures.mkdir(parents=True, exist_ok=True)
@@ -377,48 +365,15 @@ async def render(start_seconds, end_seconds, track_guids):
         raise BridgeError('The project or bridge changed during rendering; capture rejected.')
     result = empty_lists(receipt['result'], 'targets', 'soloed_tracks', 'excluded_tracks', 'bar_grid')
     rendered = workspace / 'mix.wav'
-    info = soundfile.info(str(rendered))
-    if abs(info.duration - (end_seconds - start_seconds)) > max(.1, 2 / info.samplerate):
+    info = wav_info(rendered)
+    if abs(info['duration_seconds'] - (end_seconds - start_seconds)) > max(.1, 2 / info['sample_rate']):
         raise BridgeError('The rendered length differs from the requested range; check REAPER render settings.')
     wav = captures / f'capture-{capture_id}.wav'
     rendered.replace(wav)
     for leftover in workspace.iterdir():
         leftover.unlink()
     workspace.rmdir()
-    return wav, {**result, 'project_id': before['project_id'], 'render_wall_seconds': round(time.monotonic() - began, 3)}
-
-
-def analyse(samples, sample_rate, wav, grid, wav_start_seconds, summary, spectrogram, panels, dynamic_range_db,
-            top_dbfs, table):
-    """Spectrogram PNG (when asked) and per-bar table text."""
-    from . import audio
-    png = None
-    if spectrogram:
-        duration = len(samples) / sample_rate
-        span = f'bars {grid[0]["bar"]}-{grid[-1]["bar"]} ({len(grid)} bars)' if grid else f'{duration:.2f} s'
-        rng = summary.get('range') or {}
-        when = f", project {rng['start_seconds']:.2f}-{rng['end_seconds']:.2f} s" if 'start_seconds' in rng else ''
-        isolated = ', '.join(t.get('track', '') for t in summary.get('isolated_tracks') or [])
-        title = f'{Path(wav).stem}: {span}{when}' + (f' | solo: {isolated}' if isolated else '')
-        png = Path(wav).with_name(Path(wav).stem + '-' + '-'.join(panels) + '.png')
-        summary['spectrogram'] = audio.render_spectrogram(
-            samples, sample_rate, png, title=title, bar_grid=grid, wav_start_seconds=wav_start_seconds,
-            panels=panels, dynamic_range_db=dynamic_range_db, top_dbfs=top_dbfs)
-    text = ''
-    if table:
-        text = audio.format_table(audio.bar_table(samples, sample_rate, grid, wav_start_seconds)) if grid else \
-            '# no bar grid, so no per-bar table'
-    return png, text
-
-
-def reply(summary, table, png, name):
-    parts = [output(summary, name) + ('\n' + table if table else '')]
-    if png is not None:
-        parts.append(Image(path=png))
-    return parts
-
-
-Panels = list[Literal['full', 'lowband', 'side']]
+    return wav, info, {**result, 'project_id': before['project_id'], 'render_wall_seconds': round(time.monotonic() - began, 3)}
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True,
@@ -429,44 +384,32 @@ async def capture(
         start_seconds: Annotated[float | None, Field(description='Alternative to bars: project time.')] = None,
         end_seconds: float | None = None,
         track_guids: Annotated[list[str] | None, Field(
-            description='Solo these tracks (through their sends and parents); omit for the full mix.')] = None,
-        spectrogram: Annotated[bool, Field(description='Also draw a bar-labelled spectrogram image.')] = False,
-        panels: Annotated[Panels, Field(description='full = 20 Hz-20 kHz, lowband = 20-500 Hz, side = L-R.')] =
-        ['full', 'lowband'],
-        top_dbfs: Annotated[float | None, Field(
-            description='Fixed top of the colour scale so two images compare; omit for automatic.')] = None,
-        dynamic_range_db: float = 80.0,
-        table: Annotated[bool, Field(description='Print the per-bar band table.')] = True):
-    """Render a range of the project offline to a WAV and measure it: peak/RMS, then one line per bar
-    with band energy (sub 20-60 Hz ... air 10-20 kHz, dBFS), total RMS, spectral centroid and side/mid.
-    Use this instead of guessing what something sounds like, and before/after any change.
-    Requires REAPER's render speed set to Full-speed Offline once (File > Render). Stops playback if
-    playing; restores render settings, mute and solo; the project is not changed. The WAV and a .json
-    sidecar with the bar grid are kept for spectrogram."""
+            description='Solo these tracks (through their sends and parents); omit for the full mix.')] = None) -> str:
+    """Render a range of the project offline to a 48 kHz float WAV, for measuring what you cannot hear.
+    Returns the WAV path, the bar -> seconds grid, tempo and meter; a .json sidecar next to the WAV keeps
+    the grid. Measure it with the reaper skill's analyze.py script (levels, per-bar band table, before/after
+    comparison, optional spectrogram). Requires REAPER's render speed set to Full-speed Offline once
+    (File > Render). Stops playback if playing; restores render settings, mute and solo; the project is
+    not changed."""
     try:
         mode, start, end = capture_range(start_bar, end_bar, start_seconds, end_seconds)
         guids = coerce_track_guids(track_guids)
-        options = spectrogram_options(panels, dynamic_range_db, top_dbfs) if spectrogram else None
     except ValueError as error:
         return output({'ok': False, 'error': f'Bad arguments: {error}'}, 'capture')
     try:
-        import soundfile
-        from . import audio
         if mode == 'bars':
             musical = await bar_range(start, end)
             first, last = musical['start_seconds'], musical['end_seconds']
         else:
             first, last = start, end
-        wav, result = await render(first, last, guids)
-        samples, sample_rate = soundfile.read(str(wav), dtype='float64', always_2d=True)
+        wav, info, result = await render(first, last, guids)
         grid = [row for row in result.get('bar_grid') or [] if isinstance(row, dict)]
         summary = {
-            'ok': True, 'wav': str(wav),
+            'ok': True, 'wav': str(wav), 'sidecar': str(wav.with_suffix('.json')),
             'range': {'start_seconds': first, 'end_seconds': last,
-                      'duration_seconds': round(len(samples) / sample_rate, 6),
+                      'duration_seconds': round(info['duration_seconds'], 6),
                       **({'start_bar': start, 'end_bar_exclusive': end} if mode == 'bars' else {})},
-            **summarize_grid(grid), 'levels': audio.levels(samples),
-            'sample_rate': sample_rate, 'channels': int(samples.shape[1]),
+            **summarize_grid(grid), 'sample_rate': info['sample_rate'], 'channels': info['channels'],
             'scope': result.get('listening_scope'), 'capture_point': result.get('capture_point'),
             'isolated_tracks': result.get('targets') or [], 'state_restored': result.get('state_restored'),
             'stopped_playback': result.get('stopped_playback'), 'render_wall_seconds': result.get('render_wall_seconds'),
@@ -474,48 +417,11 @@ async def capture(
         if result.get('stopped_playback'):
             summary['playback_notice'] = 'REAPER was playing, so playback was stopped to render; it was not restarted.'
         sidecar = {**summary, 'wav_start_seconds': first, 'bar_grid': grid, 'project_id': result.get('project_id')}
-        wav.with_suffix('.json').write_text(json.dumps(sidecar, ensure_ascii=False, indent=1), encoding='utf-8')
-        png, text = await asyncio.to_thread(
-            analyse, samples, sample_rate, wav, grid, first, summary, spectrogram,
-            *(options or (None, None, None)), table)
-        return reply(summary, text, png, 'capture')
+        await asyncio.to_thread(wav.with_suffix('.json').write_text,
+                                json.dumps(sidecar, ensure_ascii=False, indent=1), encoding='utf-8')
+        return output(summary, 'capture')
     except Exception as error:
         return output({'ok': False, 'error': f'{type(error).__name__}: {error}'}, 'capture')
-
-
-@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False), structured_output=False)
-async def spectrogram(
-        wav: Annotated[str, Field(description='A WAV path, typically from capture (its .json sidecar gives the bar grid).')],
-        panels: Panels = ['full', 'lowband'],
-        top_dbfs: Annotated[float | None, Field(
-            description='Fixed top of the colour scale so two images compare; omit for automatic.')] = None,
-        dynamic_range_db: float = 80.0,
-        bar_grid: Annotated[dict[str, float] | None, Field(
-            description='{bar: start_seconds} when the WAV has no sidecar.')] = None,
-        wav_start_seconds: Annotated[float | None, Field(
-            description='Project time of the first sample, with bar_grid.')] = None,
-        table: bool = True):
-    """Draw a spectrogram image (and the per-bar table) of a WAV file without rendering again."""
-    try:
-        options = spectrogram_options(panels, dynamic_range_db, top_dbfs)
-        import soundfile
-        from . import audio
-        path = Path(wav)
-        samples, sample_rate = soundfile.read(str(path), dtype='float64', always_2d=True)
-        sidecar_path = path.with_suffix('.json')
-        sidecar = json.loads(sidecar_path.read_text(encoding='utf-8')) if sidecar_path.exists() else {}
-        start = float(wav_start_seconds if wav_start_seconds is not None else sidecar.get('wav_start_seconds', 0.0))
-        grid = audio.normalize_bar_grid(bar_grid if bar_grid is not None else sidecar.get('bar_grid'),
-                                        len(samples) / sample_rate, start)
-        summary = {'ok': True, 'wav': str(path), 'levels': audio.levels(samples),
-                   **{k: sidecar[k] for k in ('range', 'scope', 'isolated_tracks') if k in sidecar},
-                   'bar_grid_source': 'arguments' if bar_grid is not None else
-                   ('sidecar' if sidecar.get('bar_grid') else 'none')}
-        png, text = await asyncio.to_thread(analyse, samples, sample_rate, path, grid, start, summary, True,
-                                            *options, table)
-        return reply(summary, text, png, 'spectrogram')
-    except Exception as error:
-        return output({'ok': False, 'error': f'{type(error).__name__}: {error}'}, 'spectrogram')
 
 
 def main():
