@@ -66,6 +66,23 @@ local function shown(track, index, param)
   return text
 end
 
+-- How a parameter displays at a normalized value. The default asks the plugin
+-- to format the value without setting it. Some plugins answer that with their
+-- current display (or a wrong one), so the live probe sets the parameter and
+-- reads it back instead; it leaves the parameter at the last probed value.
+local function formatter(track, index, param)
+  return function(value) return format_at(track, index, param, value) end
+end
+
+function fx.live_probe(track, index, param)
+  return function(value)
+    reaper.TrackFX_SetParamNormalized(track, index, param, value)
+    local text = shown(track, index, param)
+    if text == '' then return nil end
+    return text
+  end
+end
+
 -- Number and unit family of a displayed value: "1.2 kHz" -> 1200, "hz";
 -- "0.5 s" -> 500, "ms"; "-inf dB" -> -1e300, "db". nil for plain text.
 function fx.quantity(text)
@@ -90,8 +107,9 @@ end
 
 -- Discrete settings of a parameter: {{value=normalized, shown=text}, ...}, or nil
 -- for a continuous one. Uses the plugin's step size, else probes 201 points.
-function fx.choices(track, index, param, limit)
+function fx.choices(track, index, param, limit, probe)
   limit = limit or 64
+  probe = probe or formatter(track, index, param)
   local ok, step, _, _, toggle = reaper.TrackFX_GetParameterStepSizes(track, index, param)
   local positions = {}
   if ok and toggle then
@@ -104,7 +122,7 @@ function fx.choices(track, index, param, limit)
   end
   local rows, last = {}, nil
   for _, value in ipairs(positions) do
-    local text = format_at(track, index, param, value)
+    local text = probe(value)
     if not text then return nil end
     if text ~= last then rows[#rows + 1] = {value = value, shown = text}; last = text end
     if #rows > limit then return nil end
@@ -113,11 +131,11 @@ function fx.choices(track, index, param, limit)
 end
 
 -- Text settings found by probing: runs of identical displayed text across 0..1.
-local function probed_runs(track, index, param)
+local function probed_runs(probe)
   local runs = {}
   for i = 0, 200 do
     local value = i / 200
-    local text = format_at(track, index, param, value)
+    local text = probe(value)
     if not text then return nil end
     local run = runs[#runs]
     if run and run.shown == text then run.last = value else runs[#runs + 1] = {shown = text, first = value, last = value} end
@@ -165,19 +183,22 @@ local function closer(a, b, target) return math.abs(a - target) <= math.abs(b - 
 
 -- The normalized value that makes the plugin display `target` ("130 Hz",
 -- "-18 dB", "Spectral", "4:1"), or a number 0..1 when normalized is true.
--- Returns value, note. Errors when the target cannot be reached.
-function fx.resolve(track, index, param, target, normalized)
+-- Returns value, note, and what the plugin should display at value. Errors
+-- when the target cannot be reached. probe defaults to formatting without
+-- setting; pass fx.live_probe(...) for plugins whose formatting is unreliable.
+function fx.resolve(track, index, param, target, normalized, probe)
   if normalized then
     assert(type(target) == 'number' and target >= 0 and target <= 1, 'A normalized value must be a number 0..1')
     return target, 'normalized'
   end
+  probe = probe or formatter(track, index, param)
   local text = tostring(target)
-  local low_text, high_text = format_at(track, index, param, 0), format_at(track, index, param, 1)
+  local low_text, high_text = probe(0), probe(1)
   assert(low_text, 'This plugin does not report display values for unset positions; pass a normalized value (0..1) and check the readback')
   -- Discrete settings: match the displayed text.
-  local runs = fx.choices(track, index, param, 512)
+  local runs = fx.choices(track, index, param, 512, probe)
   if not runs then
-    local probed = probed_runs(track, index, param)
+    local probed = probed_runs(probe)
     if probed and #probed <= 64 then
       runs = {}
       for _, r in ipairs(probed) do runs[#runs + 1] = {value = (r.first + r.last) / 2, shown = r.shown} end
@@ -191,14 +212,20 @@ function fx.resolve(track, index, param, target, normalized)
       if s == lowered then exact = r end
       if s:find(lowered, 1, true) == 1 then prefix[#prefix + 1] = r end
     end
-    if exact then return exact.value, 'matched "' .. exact.shown .. '"' end
-    if #prefix == 1 then return prefix[1].value, 'matched "' .. prefix[1].shown .. '"' end
+    if exact then return exact.value, 'matched "' .. exact.shown .. '"', exact.shown end
+    if #prefix == 1 then return prefix[1].value, 'matched "' .. prefix[1].shown .. '"', prefix[1].shown end
   end
   -- Numeric: binary search on the displayed quantity.
   local want, want_unit = fx.quantity(text)
   local low, low_unit = fx.quantity(low_text)
   local high, high_unit = fx.quantity(high_text)
-  if not (want and low and high and low ~= high) then
+  -- Settings that are not quantities ("1/16", "Lyra") can only be matched as text.
+  local listed = false
+  for _, r in ipairs(runs or {}) do
+    local q, unit = fx.quantity(r.shown)
+    if not q or not ({hz = true, ms = true, db = true, ['%'] = true, ratio = true, [''] = true})[unit] then listed = true end
+  end
+  if listed or not (want and low and high and low ~= high) then
     local names = {}
     for _, r in ipairs(runs or {}) do names[#names + 1] = r.shown end
     error('Cannot reach "' .. text .. '"' .. (#names > 0 and ('; settings are: ' .. table.concat(names, ' | ')) or
@@ -213,17 +240,83 @@ function fx.resolve(track, index, param, target, normalized)
   if closer(high, low, want) then best, best_q = 1, high end
   for _ = 1, 48 do
     local mid = (lo + hi) / 2
-    local q = fx.quantity(format_at(track, index, param, mid) or '')
+    local q = fx.quantity(probe(mid) or '')
     if not q then break end
     if closer(q, best_q, want) then best, best_q = mid, q end
     if (q < want) == increasing then lo = mid else hi = mid end
   end
-  local note = 'displays ' .. (format_at(track, index, param, best) or '?')
+  local expected = probe(best)
+  local note = 'displays ' .. (expected or '?')
   local span = math.abs(high - low)
   if math.abs(best_q - want) > math.max(1e-6, span * 0.02) then
     note = note .. ' (closest reachable to ' .. text .. '; range ' .. low_text .. ' .. ' .. high_text .. ')'
   end
-  return best, note
+  return best, note, expected
+end
+
+-- Set a parameter to a display value (or a normalized one) and read it back.
+-- If the plugin then shows something other than what its formatting promised,
+-- or its formatting cannot reach the target at all, search again by setting
+-- and reading back. Returns value, note, after; errors (with the parameter
+-- restored) when the target cannot be reached either way.
+-- Whether formatting unset values matches what the plugin shows: it must
+-- format the current value as displayed, and not show one text everywhere.
+local function formatting_reliable(track, index, param, original)
+  local now = shown(track, index, param)
+  if format_at(track, index, param, original) ~= now then return false end
+  local low, high = format_at(track, index, param, 0), format_at(track, index, param, 1)
+  return not (low == now and high == now)
+end
+
+-- Why a plugin may ignore host changes, for error messages.
+function fx.audio_hint()
+  if reaper.Audio_IsRunning and reaper.Audio_IsRunning() == 0 then
+    return " REAPER's audio engine is stopped, and some plugins apply host changes to parameters or pin " ..
+      'layouts only while it runs: ask the user to start audio and retry, or to set it in the plugin window.'
+  end
+  return ' Some plugins ignore host changes to some parameters; ask the user to set it in the plugin window.'
+end
+
+function fx.set(track, index, param, target, normalized)
+  local original = reaper.TrackFX_GetParamNormalized(track, index, param)
+  local reliable = normalized or formatting_reliable(track, index, param, original)
+  local ok, value, note, expected = pcall(fx.resolve, track, index, param, target, normalized)
+  if not ok and reliable then error(value, 0) end
+  local after
+  if ok then
+    reaper.TrackFX_SetParamNormalized(track, index, param, value)
+    after = shown(track, index, param)
+    if normalized or after == expected then return value, note, after end
+  end
+  local live_ok, live_value, live_note, live_expected =
+    pcall(fx.resolve, track, index, param, target, false, fx.live_probe(track, index, param))
+  if not live_ok then
+    -- Searching found nothing: tell a plugin that ignores every change apart from an unreachable target.
+    local ignored = true
+    for _, probe_value in ipairs({0, 1}) do
+      reaper.TrackFX_SetParamNormalized(track, index, param, probe_value)
+      if math.abs(reaper.TrackFX_GetParamNormalized(track, index, param) - original) > 1e-9 then ignored = false end
+    end
+    reaper.TrackFX_SetParamNormalized(track, index, param, original)
+    if ignored then error('The plugin did not take new values for this parameter.' .. fx.audio_hint(), 0) end
+    error(live_value, 0)
+  end
+  reaper.TrackFX_SetParamNormalized(track, index, param, live_value)
+  after = shown(track, index, param)
+  if live_expected and after ~= live_expected then
+    reaper.TrackFX_SetParamNormalized(track, index, param, original)
+    error('The plugin did not keep "' .. tostring(target) .. '" (it shows ' .. after .. '); parameter restored', 0)
+  end
+  return live_value, live_note .. ' (found by setting and reading back: the plugin does not format unset values reliably)', after
+end
+
+-- TrackFX_SetPinMappings does not mark the project changed, so REAPER adds no
+-- Undo point for it (verified in REAPER 7.81). Switching the FX off and on in
+-- the same call does, and that Undo point restores the pins as well.
+function fx.mark_changed(track, index)
+  local enabled = reaper.TrackFX_GetEnabled(track, index)
+  reaper.TrackFX_SetEnabled(track, index, not enabled)
+  reaper.TrackFX_SetEnabled(track, index, enabled)
 end
 
 -- Input pins: names and the channels each one reads (1-based, up to 64).

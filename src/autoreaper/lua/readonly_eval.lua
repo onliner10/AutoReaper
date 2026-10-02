@@ -32,7 +32,9 @@ MIDI_EnumSelNotes MIDI_EnumSelCC MIDI_EnumSelTextSysexEvts
 CountTrackEnvelopes GetTrackEnvelope GetTrackEnvelopeByName GetTrackEnvelopeByChunkName
 GetEnvelopeName GetEnvelopeInfo_Value CountEnvelopePoints CountEnvelopePointsEx
 GetEnvelopePoint GetEnvelopePointEx GetEnvelopePointByTime GetEnvelopePointByTimeEx
-Envelope_Evaluate CountAutomationItems
+Envelope_Evaluate Envelope_FormatValue CountAutomationItems GetEnvelopeScalingMode
+ScaleFromEnvelopeMode ScaleToEnvelopeMode CountTakeEnvelopes GetTakeEnvelope GetTakeEnvelopeByName
+Undo_CanUndo2 Undo_CanRedo2 GetToggleCommandState GetToggleCommandStateEx
 CountTempoTimeSigMarkers GetTempoTimeSigMarker TimeMap_GetTimeSigAtTime
 TimeMap2_timeToBeats TimeMap2_beatsToTime TimeMap2_timeToQN TimeMap2_QNToTime
 TimeMap_GetDividedBpmAtTime TimeMap_GetMeasureInfo TimeMap_GetMetronomePattern
@@ -55,12 +57,12 @@ local mixed = {
   GetSetMediaItemTakeInfo_String=4, GetSetEnvelopeInfo_String=4,
   GetSetTrackSendInfo_String=6, GetSetProjectInfo=4, GetSetProjectInfo_String=4,
   GetSet_LoopTimeRange=1, GetSet_LoopTimeRange2=2,
-  GetSet_ArrangeView2=2, GetSetAutomationItemInfo=5,
+  GetSet_ArrangeView2=2, GetSetAutomationItemInfo=5, GetFXEnvelope=4,
 }
 return function(source)
-  local blocked = false
+  local blocked = nil
   local function deny(name)
-    blocked = true
+    blocked = blocked or tostring(name)
     error('Requires permission review: '..tostring(name), 0)
   end
   local api = {}
@@ -73,7 +75,7 @@ return function(source)
     local fn = native[name]
     if fn then
       api[name] = function(...)
-        if select(flag, ...) ~= false then return deny(name) end
+        if select(flag, ...) ~= false then return deny('reaper.'..name..' with its set flag not false') end
         return fn(...)
       end
     end
@@ -98,7 +100,7 @@ return function(source)
   local fn, syntax_error = load(source, 'AutoReaper read-only eval', 't', env)
   if not fn then return {status='error', error=syntax_error} end
   local ok, value = pcall(fn)
-  if blocked then return {status='needs_review'} end
+  if blocked then return {status='needs_review', blocked=blocked} end
   if not ok then return {status='error', error=tostring(value)} end
   return {status='complete', value=value}
 end

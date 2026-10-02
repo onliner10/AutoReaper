@@ -70,7 +70,7 @@ def lua():
 def resolve(lua, param, target, normalized=False):
     lua.globals().target = target
     lua.globals().normalized = normalized
-    value, note = lua.execute(f'local t = fx.track("Bass") return fx.resolve(t, fx.find(t, "test comp"), {param}, target, normalized)')
+    value, note = lua.execute(f'local t = fx.track("Bass") return fx.resolve(t, fx.find(t, "test comp"), {param}, target, normalized)')[:2]
     shown = lua.eval(f'reaper.TrackFX_FormatParamValueNormalized(nil, 0, {param}, {value!r})')[1]
     return value, shown, note
 
@@ -116,8 +116,104 @@ def test_parameter_rows_and_lookup(lua):
         lua.execute('local t = fx.track("Bass") return fx.param_index(t, 0, "drive")')
 
 
+def set_param(lua, param, target, normalized=False):
+    lua.globals().target = target
+    lua.globals().normalized = normalized
+    return lua.execute(f'local t = fx.track("Bass") return fx.set(t, 0, {param}, target, normalized)')
+
+
+def test_set_reads_back_what_it_set(lua):
+    value, note, after = set_param(lua, 1, '-18 dB')
+    assert after == '-18.0 dB' and 'reading back' not in note
+
+
+def test_set_searches_live_when_the_plugin_formats_its_current_value(lua):
+    # Like some VST3s: formatting any position returns what is displayed now.
+    lua.execute("reaper.TrackFX_FormatParamValueNormalized = function(t, f, p) "
+                "return reaper.TrackFX_GetFormattedParamValue(t, f, p) end")
+    assert set_param(lua, 1, '-18 dB')[2] == '-18.0 dB'
+    value, note, after = set_param(lua, 2, 'Spectral')
+    assert after == 'Spectral' and 'reading back' in note
+
+
+def test_set_searches_live_when_the_plugin_formats_wrong_values(lua):
+    # Like some CLAPs: formatting answers, but not with what the plugin then shows.
+    lua.execute("reaper.TrackFX_FormatParamValueNormalized = function(t, f, p, v) "
+                "return true, string.format('%+.1f dB', -30 + 60 * (1 - v)) end")
+    value, note, after = set_param(lua, 1, '+12 dB')
+    assert after == '+12.0 dB' and 'reading back' in note
+
+
+def test_set_restores_the_parameter_when_the_target_is_unreachable(lua):
+    lua.execute("reaper.TrackFX_FormatParamValueNormalized = function(t, f, p) "
+                "return reaper.TrackFX_GetFormattedParamValue(t, f, p) end")
+    with pytest.raises(lua_module.LuaError, match='Vintage'):
+        set_param(lua, 2, 'Vintage')
+    assert lua.eval('reaper.TrackFX_GetParamNormalized(nil, 0, 2)') == 0
+
+
+def run_body(lua, body, **arguments):
+    return lua.execute(server.fx_program(body, **arguments))
+
+
+def test_set_fx_parameters_reports_changed_from_its_readback(lua):
+    first = run_body(lua, server.SET_FX_PARAMETERS, track='Bass', fx=0, changes=[{'param': 'Gain', 'value': '-18 dB'}])
+    assert first['changed'] is True and first['failed'] == 0
+    again = run_body(lua, server.SET_FX_PARAMETERS, track='Bass', fx=0, changes=[{'param': 'Gain', 'value': '-18 dB'}])
+    assert again['changed'] is False
+
+
+def test_track_names_resolve_to_guids(lua):
+    result = run_body(lua, server.RESOLVE_TRACKS, refs=['Bass'])
+    assert result['guids'][1] == '{AAAA0000-0000-0000-0000-000000000001}'
+    with pytest.raises(lua_module.LuaError, match='No track'):
+        run_body(lua, server.RESOLVE_TRACKS, refs=['Kick'])
+
+
 def test_server_programs_compile():
     runtime = lua_module.LuaRuntime()
     compile_ = runtime.eval('function(src) local f, e = load(src) return e end')
-    for body in (server.ADD_FX, server.FX_PARAMETERS, server.SET_FX_PARAMETERS, server.EDIT_FX, server.SIDECHAIN_SEND):
+    for body in (server.ADD_FX, server.FX_PARAMETERS, server.SET_FX_PARAMETERS, server.EDIT_FX, server.SIDECHAIN_SEND,
+                 server.RESOLVE_TRACKS):
         assert compile_(server.fx_program(body, track='Bass', fx=0)) is None
+
+
+def test_set_does_not_probe_live_when_formatting_is_reliable(lua):
+    lua.execute("sets = 0 local old = reaper.TrackFX_SetParamNormalized "
+                "reaper.TrackFX_SetParamNormalized = function(...) sets = sets + 1 return old(...) end")
+    with pytest.raises(lua_module.LuaError, match='settings are: Clean'):
+        set_param(lua, 2, 'Vintage')
+    assert lua.eval('sets') == 0
+
+
+def test_set_says_when_the_plugin_ignores_changes(lua):
+    # Seen with a CLAP plugin: sets return true and change nothing.
+    lua.execute("reaper.TrackFX_SetParamNormalized = function() return true end "
+                "reaper.Audio_IsRunning = function() return 0 end")
+    with pytest.raises(lua_module.LuaError, match='did not take new values.*audio engine is stopped'):
+        set_param(lua, 1, '-18 dB')
+    lua.execute("reaper.TrackFX_FormatParamValueNormalized = function(t, f, p) "
+                "return reaper.TrackFX_GetFormattedParamValue(t, f, p) end "
+                "reaper.Audio_IsRunning = function() return 1 end")
+    with pytest.raises(lua_module.LuaError, match='did not take new values.*plugin window'):
+        set_param(lua, 1, '-18 dB')
+
+
+def test_set_accepts_a_plugin_that_quantizes(lua):
+    # Gain stored in steps of 1/12 (5 dB): the searched position snaps, the live search finds the step.
+    lua.execute("local old = reaper.TrackFX_SetParamNormalized "
+                "reaper.TrackFX_SetParamNormalized = function(t, f, p, v) "
+                "if p == 1 then v = math.floor(v * 12 + 0.5) / 12 end return old(t, f, p, v) end")
+    value, note, after = set_param(lua, 1, '+5 dB')
+    assert after == '+5.0 dB'
+    assert set_param(lua, 1, '+5 dB')[2] == '+5.0 dB'  # already there: no false "did not take"
+
+
+def test_note_value_lists_are_matched_as_text(lua):
+    lua.execute("local old = reaper.TrackFX_FormatParamValueNormalized "
+                "local notes = {'1/64', '1/32', '1/16', '1/8', '1/4'} "
+                "reaper.TrackFX_FormatParamValueNormalized = function(t, f, p, v) "
+                "if p == 4 then return true, notes[math.floor(v * 4 + 0.5) + 1] end return old(t, f, p, v) end")
+    assert resolve(lua, 4, '1/8')[1] == '1/8'
+    with pytest.raises(lua_module.LuaError, match='settings are: 1/64 | 1/32'):
+        resolve(lua, 4, '1/8.')

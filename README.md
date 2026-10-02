@@ -16,7 +16,7 @@ It has two parts:
 |---|---|
 | `reaper_status` | Whether REAPER and the bridge are running; REAPER version, open project |
 | `install_bridge` | Copies the bridge script into REAPER's `Scripts` folder; a running bridge reloads it |
-| `inspect_project` | Tracks (GUIDs, volume, pan, mute/solo, folders), FX, items, markers, tempo |
+| `inspect_project` | Tracks (GUIDs, volume, pan, mute/solo, folders), FX, items, markers, tempo; filter by track name or bars |
 | `inspect_signal_flow` | Folder tree, sends, sidechains, sources, master FX |
 | `search_installed_fx` | Installed plugin names, without loading any |
 | `reaper_eval` | Read-only ReaScript Lua in a sandbox (getters only) |
@@ -24,16 +24,18 @@ It has two parts:
 | `read_receipt` | The result of a request that timed out, without running it again |
 | `add_fx` | Adds a plugin by name or words from it; lists candidates when several match |
 | `fx_parameters` | A plugin's parameters as it displays them, with ranges, list options and input pins |
-| `set_fx_parameters` | Sets parameters by display value ("130 Hz", "-18 dB", "Spectral") and reads them back |
+| `set_fx_parameters` | Sets parameters by display value ("130 Hz", "-18 dB", "Spectral") and checks the readback |
 | `edit_fx` | Bypass, enable, offline, remove, move or show a plugin |
 | `sidechain_send` | Audio sidechain (send, track channels, plugin pins) or MIDI trigger send on a MIDI bus |
-| `capture` | Renders a bar or time range (full mix or soloed tracks) offline to a WAV |
+| `capture` | Renders a bar or time range (full mix or tracks soloed by GUID or name) offline to a WAV |
 
 A `reaper` skill tells Claude how to use them: inspect first, measure before and after, and edit
 only what you asked for. It includes `scripts/analyze.py`, which Claude runs on captured WAVs:
 
 - levels and a per-bar table of band energy (sub to air), RMS, spectral centroid and side/mid,
 - `--compare before.wav`: the per-bar difference in dB, for "did this change help?",
+- `--steps 16`: the same per sixteenth of the bar, averaged over bars, for groove and ducking
+  (`--bars 57-64` limits any table to a range),
 - `--spectrogram`: a PNG with bar lines, for an overview. Conclusions come from the numbers.
 
 The analysis runs outside the MCP server (`uv run --script`, which installs numpy, soundfile and

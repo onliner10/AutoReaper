@@ -9,7 +9,9 @@ and an optional spectrogram image.
 
 Prints one JSON line (levels, bar grid source, files written), then text tables:
 - per-bar band energy (sub 20-60 Hz ... air 10-20 kHz, dBFS), total RMS, spectral centroid, side/mid;
-- with --compare: the same table for WAV minus BEFORE_WAV, bar by bar (positive = louder in WAV).
+- with --compare: the same table for WAV minus BEFORE_WAV, bar by bar (positive = louder in WAV);
+- with --steps N: the same per position in the bar (N parts, e.g. 16 sixteenths), averaged over the bars;
+- with --bars A-B: only those bars.
 The bar grid comes from the capture's .json sidecar (or --bar-grid). Levels are dBFS of the
 original float samples: a full-scale sine reads -3 dB RMS in the table and 0 dB on the spectrogram.
 """
@@ -80,21 +82,27 @@ def power_spectrum(x, sample_rate):
     return np.fft.rfftfreq(n, 1 / sample_rate), power
 
 
-def segment_row(samples, sample_rate):
-    """Band energies, total RMS, centroid and side/mid for one stretch of audio."""
+def segment_powers(samples, sample_rate):
+    """Linear mean-square values of one stretch of audio: per band, total, centroid weights, mid and side."""
     stereo = as_stereo(samples)
     freqs, left = power_spectrum(stereo[:, 0], sample_rate)
     _, right = power_spectrum(stereo[:, 1], sample_rate)
     power = (left + right) / 2  # mean power over the two channels
-    row = {}
-    for name, low, high in BANDS:
-        row[name] = round(db(float(power[(freqs >= low) & (freqs < high)].sum())), 1)
-    row['total'] = round(db(float(np.mean(stereo * stereo))), 1)
+    powers = {name: float(power[(freqs >= low) & (freqs < high)].sum()) for name, low, high in BANDS}
     audible = (freqs >= 20) & (freqs <= 20000)
-    weight = float(power[audible].sum())
-    row['centroid_hz'] = round(float((freqs[audible] * power[audible]).sum() / weight)) if weight > 0 else 0
     mid, side = mid_side(stereo)
-    mid_power, side_power = float(np.mean(mid * mid)), float(np.mean(side * side))
+    powers.update(total=float(np.mean(stereo * stereo)), weight=float(power[audible].sum()),
+                  weighted_hz=float((freqs[audible] * power[audible]).sum()),
+                  mid_channel=float(np.mean(mid * mid)), side_channel=float(np.mean(side * side)))
+    return powers
+
+
+def powers_row(powers):
+    """Band energies (dB), total RMS, centroid and side/mid from segment_powers values."""
+    row = {name: round(db(powers[name]), 1) for name, _, _ in BANDS}
+    row['total'] = round(db(powers['total']), 1)
+    row['centroid_hz'] = round(powers['weighted_hz'] / powers['weight']) if powers['weight'] > 0 else 0
+    mid_power, side_power = powers['mid_channel'], powers['side_channel']
     if side_power <= 0:
         row['side_mid_db'] = FLOOR_DB
     elif mid_power <= 0:
@@ -102,6 +110,11 @@ def segment_row(samples, sample_rate):
     else:
         row['side_mid_db'] = round(max(FLOOR_DB, 10 * math.log10(side_power / mid_power)), 1)
     return row
+
+
+def segment_row(samples, sample_rate):
+    """Band energies, total RMS, centroid and side/mid for one stretch of audio."""
+    return powers_row(segment_powers(samples, sample_rate))
 
 
 def bar_segments(bar_grid, wav_start_seconds, duration_seconds, sample_rate, total_samples):
@@ -128,18 +141,62 @@ def bar_table(samples, sample_rate, bar_grid, wav_start_seconds):
     return rows
 
 
+def step_label(step, steps):
+    """1-based step in a bar as beat.subdivision when steps divide into 4 beats ("2.3"), else the number."""
+    if steps % 4 == 0 and steps > 4:
+        per_beat = steps // 4
+        return f'{(step - 1) // per_beat + 1}.{(step - 1) % per_beat + 1}'
+    return str(step)
+
+
+def step_table(samples, sample_rate, bar_grid, wav_start_seconds, steps):
+    """Per position in the bar (each bar cut into `steps` equal parts): energy averaged over the bars.
+
+    Shows rhythmic detail a per-bar table hides: what plays on the beat versus off it, how a
+    ducker or a hat pattern shapes each sixteenth. Only bars wholly inside the recording count,
+    so every step averages the same number of slices.
+    """
+    samples = as_stereo(samples)
+    duration = len(samples) / sample_rate
+    whole = [bar for bar in bar_grid if bar['start_seconds'] - wav_start_seconds >= -1e-6
+             and bar['end_seconds'] - wav_start_seconds <= duration + 1e-6]
+    if not whole:
+        return []
+    sums = [None] * steps
+    for bar in whole:
+        edges = np.linspace(bar['start_seconds'] - wav_start_seconds, bar['end_seconds'] - wav_start_seconds, steps + 1)
+        for step in range(steps):
+            first = max(0, int(round(edges[step] * sample_rate)))
+            last = min(len(samples), int(round(edges[step + 1] * sample_rate)))
+            if last - first < 16:
+                raise ValueError('--steps is too fine for this tempo and sample rate')
+            powers = segment_powers(samples[first:last], sample_rate)
+            sums[step] = powers if sums[step] is None else {k: sums[step][k] + v for k, v in powers.items()}
+    return [{'bar': step_label(step + 1, steps), **powers_row({k: v / len(whole) for k, v in sums[step].items()})}
+            for step in range(steps)]
+
+
+def select_bars(grid, bars):
+    """The grid rows within an inclusive "A-B" (or single "A") bar range."""
+    if not bars:
+        return grid
+    first, _, last = bars.partition('-')
+    first, last = int(first), int(last or first)
+    return [row for row in grid if first <= row['bar'] <= last]
+
+
 TABLE_COLUMNS = ('sub', 'low', 'lowmid', 'mid', 'highmid', 'high', 'air', 'total', 'centroid_hz', 'side_mid_db')
 
 
-def format_table(rows):
-    """One line per bar; the header names the units."""
-    header = ('bar   sub20-60 low60-150 lm150-500 mid.5-2k hm2-5k hi5-10k air10-20k | totalRMS centroid S/M')
-    lines = ['# per-bar energy dBFS (mean of L/R power; total = RMS, full-scale sine = -3); '
-             'centroid Hz over 20-20k; S/M = side/mid power dB', header]
+def format_table(rows, unit='bar', note=''):
+    """One line per bar (or step); the header names the units."""
+    header = f'{unit:<5} sub20-60 low60-150 lm150-500 mid.5-2k hm2-5k hi5-10k air10-20k | totalRMS centroid S/M'
+    lines = [f'# per-{unit} energy dBFS (mean of L/R power; total = RMS, full-scale sine = -3); '
+             f'centroid Hz over 20-20k; S/M = side/mid power dB{note}', header]
     for row in rows:
         bands = ' '.join(f"{row[name]:>{width}.1f}" for name, width in zip(
             ('sub', 'low', 'lowmid', 'mid', 'highmid', 'high', 'air'), (8, 9, 9, 8, 6, 7, 9)))
-        lines.append(f"{row['bar']:<4} {bands} | {row['total']:>8.1f} {row['centroid_hz']:>8d} "
+        lines.append(f"{str(row['bar']):<5} {bands} | {row['total']:>8.1f} {row['centroid_hz']:>8d} "
                      f"{row['side_mid_db']:>5.1f}")
     return '\n'.join(lines)
 
@@ -388,9 +445,10 @@ def difference_rows(after, before):
     return rows
 
 
-def format_difference_table(rows):
-    header = 'bar   sub20-60 low60-150 lm150-500 mid.5-2k hm2-5k hi5-10k air10-20k | totalRMS centroid S/M'
-    lines = ['# difference in dB, WAV minus --compare (positive = more energy in WAV); centroid in Hz', header]
+def format_difference_table(rows, unit='bar'):
+    header = f'{unit:<5} sub20-60 low60-150 lm150-500 mid.5-2k hm2-5k hi5-10k air10-20k | totalRMS centroid S/M'
+    lines = [f'# difference per {unit} in dB, WAV minus --compare (positive = more energy in WAV); centroid in Hz',
+             header]
     for row in rows:
         bands = ' '.join(f"{row[name]:>+{width}.1f}" for name, width in zip(
             ('sub', 'low', 'lowmid', 'mid', 'highmid', 'high', 'air'), (8, 9, 9, 8, 6, 7, 9)))
@@ -418,7 +476,14 @@ def parse_args(argv):
     parser.add_argument('--bar-grid', help='JSON {bar: start_seconds} when the WAV has no sidecar')
     parser.add_argument('--wav-start', type=float, help='project time of the first sample, with --bar-grid')
     parser.add_argument('--no-table', action='store_true', help='skip the per-bar table')
+    parser.add_argument('--steps', type=int, help='also a table per position in the bar (16 = sixteenths), '
+                                                  'averaged over the bars; with --compare, its difference too')
+    parser.add_argument('--bars', help='only these bars, inclusive: "57-64" or "57"')
     args = parser.parse_args(argv)
+    if args.steps is not None and not 2 <= args.steps <= 64:
+        parser.error('--steps must be in 2..64')
+    if args.bars and not all(part.isdigit() for part in args.bars.split('-', 1)):
+        parser.error('--bars takes "A-B" or "A" (bar numbers)')
     args.panels = tuple(p.strip() for p in args.panels.split(',') if p.strip())
     if not args.panels or any(p not in ('full', 'lowband', 'side') for p in args.panels) \
             or len(set(args.panels)) != len(args.panels):
@@ -436,6 +501,7 @@ def main(argv=None):
     for stream in (sys.stdout, sys.stderr):
         stream.reconfigure(encoding='utf-8')
     samples, sample_rate, grid, start, sidecar = load(args.wav, args.bar_grid, args.wav_start)
+    grid = select_bars(grid, args.bars)
     duration = len(samples) / sample_rate
     summary = {'ok': True, 'wav': str(Path(args.wav)), 'duration_seconds': round(duration, 6),
                'sample_rate': sample_rate, 'levels': levels(samples),
@@ -446,8 +512,13 @@ def main(argv=None):
     rows = bar_table(samples, sample_rate, grid, start) if grid else []
     if not args.no_table:
         tables.append(format_table(rows) if grid else '# no bar grid, so no per-bar table')
+    steps = step_table(samples, sample_rate, grid, start, args.steps) if args.steps and grid else []
+    if args.steps:
+        span = f'; average of bars {grid[0]["bar"]}-{grid[-1]["bar"]}' if grid else ''
+        tables.append(format_table(steps, 'step', span) if steps else '# no whole bars, so no per-step table')
     if args.compare:
         before, before_rate, before_grid, before_start, _ = load(args.compare)
+        before_grid = select_bars(before_grid, args.bars)
         summary['compare'] = {'wav': str(Path(args.compare)), 'levels': levels(before)}
         summary['level_difference_db'] = {k: round(summary['levels'][k] - summary['compare']['levels'][k], 2)
                                           for k in ('peak_dbfs', 'rms_dbfs')}
@@ -459,6 +530,9 @@ def main(argv=None):
             diff = difference_rows([{'bar': 'all', **segment_row(samples, sample_rate)}],
                                    [{'bar': 'all', **segment_row(before, before_rate)}])
         tables.append(format_difference_table(diff))
+        if steps and before_grid:
+            before_steps = step_table(before, before_rate, before_grid, before_start, args.steps)
+            tables.append(format_difference_table(difference_rows(steps, before_steps), 'step'))
     if args.spectrogram:
         png = Path(args.wav).with_name(Path(args.wav).stem + '-' + '-'.join(args.panels) + '.png')
         summary['spectrogram'] = render_spectrogram(

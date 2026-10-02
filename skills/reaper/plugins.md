@@ -3,6 +3,10 @@
 Read this before adding, configuring or routing plugins. Nothing here is specific to one plugin:
 learn each plugin from what it exposes, its manual, and measurements.
 
+Add a plugin only when the user asked for one or agreed to your proposal. Never put one on the
+master or on a new track on your own: first look for what the project already has (the FX on the
+track, existing automation lanes) and work with that, or propose the addition and wait.
+
 ## Tools
 
 | Tool | Use |
@@ -23,13 +27,17 @@ part of its name. Prefer GUIDs from `inspect_project` when names repeat.
    "side", "mode"). The `range` shows units and limits; `choices` shows a list parameter's options.
    Parameter names can be vague; check the display range or the manual before assuming what one does.
 2. **Set by display value, never by guessing 0..1.** Then compare each result's `after` with what you
-   asked. A note "closest reachable" means the value is outside the range. If a plugin cannot display
-   unset values, `set_fx_parameters` says so; then pass `normalized: true` and check the readback.
+   asked. A note "closest reachable" means the value is outside the range. Some plugins format unset
+   values wrongly or not at all; `set_fx_parameters` notices when the readback differs from the
+   prediction and then searches by setting and reading back (the note says "found by setting and
+   reading back"). A change it cannot reach fails and leaves that parameter as it was. `changed` is
+   true when any parameter's value or display moved.
 3. **Measure the effect** (`capture` + `analyze.py --compare`) on the same range before and after,
    ideally on the track solo and in the mix. When comparing plugins or settings, match levels first, or
    the louder one wins.
-4. **Keep changes reversible.** Every tool call is one Undo step. To compare alternatives, add the new
-   plugin bypassed, set it up, then switch which one is bypassed instead of deleting the old one.
+4. **Keep changes reversible.** Every tool call is one Undo step (`sidechain_send` included, also for
+   pin changes). To compare alternatives, add the new plugin bypassed, set it up, then switch which one
+   is bypassed instead of deleting the old one.
 
 ## What the host cannot see
 
@@ -53,6 +61,11 @@ target, widens the target track to 4 channels and connects the plugin's input pi
 "Side Chain", "Aux" or "Key" (else pins 3/4) to those channels. Then switch the plugin's own sidechain
 or key-input setting to external with `set_fx_parameters` (look for it with `query: "side"`).
 Check `pins_after`. If the target already uses channels 3/4 (multi-out instruments), use 5.
+A multi-out instrument earlier in the chain writes every output it has mapped, silence included: if
+its outputs reach the key channels, they overwrite the key before the plugin hears it. Read the
+instrument's output pins (`TrackFX_GetPinMappings(track, fx, 1, pin)`) and map its unused outputs off
+the key channels, or keep the key above the highest channel it uses. Then render the target with the
+source and check the plugin actually reacts (gain reduction in time with the key).
 
 **MIDI trigger** (plugins that duck or gate on MIDI notes): `kind: "midi"`. A plugin listens to all
 MIDI on its track. If the target track also has an instrument or its own notes, those notes trigger
@@ -72,3 +85,7 @@ channel n is `1 << (n-1)`), pin names (`TrackFX_GetNamedConfigParm(track, fx, "i
 (`I_SRCCHAN` = -1 for MIDI only; `I_MIDIFLAGS`: low 5 bits source channel, 31 disables MIDI,
 `(flags >> 22) & 255` destination bus), parameter modulation and links
 (`param.N.mod.*`, `param.N.plink.*` named config), or take FX (`TakeFX_*`).
+
+REAPER adds no Undo point for `TrackFX_SetPinMappings` alone (the change is applied but Ctrl+Z skips
+it). In the same `reaper_eval_write` call, switch that FX off and on again
+(`TrackFX_SetEnabled(track, fx, false)` then `true`); the Undo point then restores the pins too.

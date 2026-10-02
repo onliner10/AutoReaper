@@ -87,7 +87,9 @@ def test_bridge_lua_runs_reads_edits_and_reports_errors(tmp_path):
         assert sandbox['result'] == {'status': 'complete', 'value': 3}
         blocked = asyncio.run(client.evaluate(
             server.readonly_program('reaper.SetMediaTrackInfo_Value(nil, "D_VOL", 1)'), mutate=False))
-        assert blocked['result']['status'] == 'needs_review'
+        assert blocked['result'] == {'status': 'needs_review', 'blocked': 'reaper.SetMediaTrackInfo_Value'}
+        undo = asyncio.run(client.evaluate(server.readonly_program('return reaper.Undo_CanUndo2(0) == nil'), mutate=False))
+        assert undo['result'] == {'status': 'complete', 'value': True}
         escape = asyncio.run(client.evaluate(server.readonly_program('return os.getenv("HOME")'), mutate=False))
         assert escape['result']['status'] == 'needs_review'
 

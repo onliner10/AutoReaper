@@ -35,8 +35,11 @@ def test_track_guids():
     guid = '{0A1B2C3D-0000-1111-2222-333344445555}'
     assert server.coerce_track_guids(json.dumps([guid])) == [guid]
     assert server.coerce_track_guids(guid) == [guid] and server.coerce_track_guids(None) == []
+    assert server.coerce_track_guids(['Kick', guid]) == ['Kick', guid]
     with pytest.raises(ValueError):
-        server.coerce_track_guids(['Kick'])
+        server.coerce_track_guids(['master'])
+    with pytest.raises(ValueError):
+        server.coerce_track_guids([1])
 
 
 def test_summarize_grid_maps_bars_to_starts():
@@ -222,3 +225,23 @@ def test_spectrogram_shows_a_sine_at_its_row_and_level(tmp_path):
                                           panels=('full', 'side'))
     assert (tmp_path / 's.png').exists() and receipt['db_scale']['top_dbfs'] == 0
     assert receipt['x_axis'].startswith('seconds')
+
+
+def test_analyze_steps_show_what_plays_on_the_beat(tmp_path, capsys):
+    # Three 2-second bars; an 80 Hz burst on each beat (first sixteenth of four), silence otherwise.
+    t = np.arange(6 * SR) / SR
+    on_beat = (t % 0.5) < 0.125
+    x = np.where(on_beat, 0.5 * np.sin(2 * np.pi * 80 * t), 0.0)
+    after, before = tmp_path / 'after.wav', tmp_path / 'before.wav'
+    write_capture(after, np.stack([x, x], 1), 0.0, {'1': 0.0, '2': 2.0, '3': 4.0})
+    write_capture(before, np.stack([x, x], 1) * 0.5, 0.0, {'1': 0.0, '2': 2.0, '3': 4.0})
+    rows = audio.step_table(*audio.load(str(after))[:4], 16)
+    assert [row['bar'] for row in rows[:5]] == ['1.1', '1.2', '1.3', '1.4', '2.1']
+    assert rows[0]['low'] > rows[1]['low'] + 40 and rows[4]['low'] == pytest.approx(rows[0]['low'], abs=0.1)
+    assert audio.main([str(after), '--compare', str(before), '--steps', '16', '--bars', '2-3', '--no-table']) == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert json.loads(lines[0])['compared_bars'] == 2
+    assert lines[1].startswith('# per-step') and 'average of bars 2-3' in lines[1]
+    step_diff = next(line for line in lines if line.startswith('# difference per step'))
+    first = lines[lines.index(step_diff) + 2]
+    assert first.startswith('1.1 ') and float(first.split()[2]) == pytest.approx(6.0, abs=0.1)  # low band
