@@ -1,6 +1,6 @@
 {
   "name": "autoreaper",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Work in your open REAPER project from Claude Code: inspect tracks, FX, MIDI and routing, edit with ReaScript (one undo step, backed up), and render ranges to measure levels and spectra.",
   "author": {
     "name": "Mateusz Urban"

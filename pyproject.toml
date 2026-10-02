@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "autoreaper"
-version = "0.2.1"
+version = "0.2.2"
 description = "REAPER tools for Claude Code: inspect and edit the open project, render and measure audio."
 readme = "README.md"
 license = "MIT"
