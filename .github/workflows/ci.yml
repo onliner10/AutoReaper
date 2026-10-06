@@ -30,11 +30,26 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # The Faust release the packages bundle: Ubuntu's libfaust (2.70) ignores the
+      # JIT target it is given and compiles for the runner's CPU model, which can
+      # name instructions the VM does not enable (Illegal instruction on znver4).
       - name: Faust (Linux)
         if: runner.os == 'Linux'
         run: |
-          sudo apt-get update
-          sudo apt-get install -y faust libx11-dev
+          sudo apt-get update -q && sudo apt-get install -y -q libx11-dev
+          version=2.88.0
+          gh release download "$version" --repo grame-cncm/faust --pattern 'libfaust-ubuntu-x86_64.zip' --pattern "faust-$version.tar.gz"
+          unzip -q libfaust-ubuntu-x86_64.zip -d libfaust && tar xzf "faust-$version.tar.gz"
+          root="$PWD/faust-root"
+          mkdir -p "$root/lib" "$root/include" "$root/share/faust"
+          cp -a libfaust/lib/libfaust.so* "$root/lib/"
+          soname=$(readelf -d "$root/lib/libfaust.so" | sed -n 's/.*Library soname: \[\(.*\)\]/\1/p')
+          [ -n "$soname" ] && [ ! -e "$root/lib/$soname" ] && ln -s libfaust.so "$root/lib/$soname"
+          cp -a "faust-$version/architecture/faust" "$root/include/faust"
+          cp "faust-$version"/libraries/*.lib "$root/share/faust/"
+          echo "FAUST_DIR=$root" >> "$GITHUB_ENV"
+          echo "AUTOREAPER_FAUST_LIBRARIES=$root/share/faust" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=$root/lib" >> "$GITHUB_ENV"
 
       - name: Faust (macOS)
         if: runner.os == 'macOS'

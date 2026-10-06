@@ -46,7 +46,9 @@ To make a package yourself: build with `-DAUTOREAPER_PACKAGE=ON` against a Faust
 
 ## Build
 
-Needs CMake 3.20+, a C++17 compiler and Faust with libfaust (2.60+); on Linux also the X11 headers. CMake
+Needs CMake 3.20+, a C++17 compiler and Faust with libfaust; on Linux also the X11 headers. Use Faust 2.88 or
+newer: older libfaust ignores the JIT target the plugin asks for and compiles for the CPU model, which crashes
+(Illegal instruction) on machines or VMs that do not enable all of that model's instructions. CMake
 fetches the CLAP SDK, Dear ImGui and ImGuiColorTextEdit. CI builds and tests it on all three systems
 (`.github/workflows/ci.yml`).
 
