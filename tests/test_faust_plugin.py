@@ -83,7 +83,7 @@ def test_installs_checks_and_upgrades(release, tmp_path):
     folder = clap / NAME
     assert (folder / f'{NAME}.clap').read_text() == 'binary 0.1.0'
     assert (folder / 'faustlibraries' / 'stdfaust.lib').is_file()
-    if sys.platform != 'win32':
+    if sys.platform.startswith('linux'):  # macOS unpacks with ditto, which keeps modes of zips ditto made
         assert (folder / f'{NAME}.clap').stat().st_mode & 0o111
     assert sorted(p.name for p in clap.iterdir()) == [NAME]  # no staging left
 
