@@ -23,21 +23,39 @@ another computer, and the code comes along. Undo restores earlier code.
 
 ## Build
 
-Needs CMake 3.16+, a C++17 compiler, Faust with libfaust (2.60+), and on Linux the X11 headers. CMake fetches
-the CLAP SDK, Dear ImGui and ImGuiColorTextEdit.
+Needs CMake 3.20+, a C++17 compiler and Faust with libfaust (2.60+); on Linux also the X11 headers. CMake
+fetches the CLAP SDK, Dear ImGui and ImGuiColorTextEdit. CI builds and tests it on all three systems
+(`.github/workflows/ci.yml`).
+
+| System | Faust | Configure |
+|---|---|---|
+| Linux (Debian/Ubuntu) | `apt install faust libx11-dev` | `cmake -S plugin -B plugin/build -DCMAKE_BUILD_TYPE=Release` |
+| macOS | `brew install faust` | add `-DFAUST_DIR=$(brew --prefix)` |
+| Windows | the `win64.exe` installer from [Faust's releases](https://github.com/grame-cncm/faust/releases) | add `-DFAUST_DIR="C:/Program Files/Faust"` (Visual Studio 2022) |
 
 ```bash
-# Debian/Ubuntu: apt install faust libx11-dev cmake g++
-cmake -S plugin -B plugin/build -DCMAKE_BUILD_TYPE=Release
-cmake --build plugin/build -j
+cmake --build plugin/build --config Release
 plugin/build/engine_test                 # ducking, MIDI and beat timing to the frame, the state format
 plugin/build/ui_snapshot window.ppm      # draws the window without a host
-mkdir -p ~/.clap && cp "plugin/build/AutoReaper Faust.clap" ~/.clap/
+plugin/build/clap_host_test "plugin/build/AutoReaper Faust.clap"   # loads the plugin as a host does
 ```
 
-Then in REAPER: Options > Preferences > Plug-ins > CLAP > Re-scan. The plugin finds the Faust libraries
-(`stdfaust.lib`) in `AUTOREAPER_FAUST_LIBRARIES`, a `faustlibraries` folder beside the plugin, or the usual Faust
-install locations.
+(With Visual Studio the programs are in `plugin/build/Release`.) Install the plugin where REAPER looks for CLAP
+plugins, then Options > Preferences > Plug-ins > CLAP > Re-scan:
+
+| System | Copy | To |
+|---|---|---|
+| Linux | `AutoReaper Faust.clap` | `~/.clap` |
+| macOS | the `AutoReaper Faust.clap` bundle | `~/Library/Audio/Plug-Ins/CLAP` |
+| Windows | `AutoReaper Faust.clap` | `%LOCALAPPDATA%\Programs\Common\CLAP` (or `C:\Program Files\Common Files\CLAP`) |
+
+The plugin loads libfaust from the Faust install: on Windows its `lib` folder (with `faust.dll`) must be on
+`PATH`, or copy the DLL beside the plugin. It finds the Faust libraries (`stdfaust.lib`) in
+`AUTOREAPER_FAUST_LIBRARIES`, a `faustlibraries` folder beside the plugin (in a macOS bundle: `Contents/Resources`),
+or the Faust install's `share/faust`.
+
+On Windows, REAPER may take some keys for its own shortcuts while the plugin window has focus; if typing in the
+editor triggers actions, enable "Send all keyboard input to plug-in" in the FX window's menu.
 
 ## Status
 
