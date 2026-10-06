@@ -77,6 +77,84 @@ Bus 2. After that set the plugin's trigger/sidechain mode to MIDI.
 **Host-synced ducking** (a plugin's own tempo-synced envelope) keeps pumping where the kick pauses;
 MIDI triggering follows the actual kick notes. Say which one you chose and why.
 
+## Faust effects
+
+When no installed plugin does the job simply, and the user agrees, write the effect in Faust with
+`add_faust_fx`. If it says REAPER does not list the plugin, offer to install it with `install_faust_plugin` (it
+downloads about 15-40 MB once); then the user re-scans plug-ins in REAPER or restarts it, as the result's `next`
+says. It runs in the Faust (AutoReaper) plugin; the user sees and edits the code in its window, and the
+project stores it. Use it for small, precise processing you can state in a few lines: a ducker keyed by another
+track, a gain or filter utility, a gate, a custom envelope. Prefer the standard library (`import("stdfaust.lib");`:
+`an.amp_follower_ar`, `ba.db2linear`, `si.smoo`, `fi.lowpass`, `co.compressor_stereo`, ...).
+
+- **Look things up instead of guessing**, offline:
+  - The language (operators, `with`, `letrec`, iterations, UI elements and metadata), MIDI metadata and compiler
+    errors: the Faust manual for the Faust version the plugin uses. Run
+    `uv run --script <skill dir>/scripts/faust_docs.py --version <faust_version>` (`faust_version` comes from
+    `read_faust_fx` or `add_faust_fx`). It prints a folder with `syntax.md`, `midi.md` and `errors.md`,
+    downloaded once (git, network) and then reused. Grep for the topic there and Read that section, not the whole
+    file. If it cannot download, say so and rely on the library documentation below.
+  - The standard library: the `.lib` files the plugin compiles with document every function (usage, parameters,
+    units), so they always match. They are in the first of: `AUTOREAPER_FAUST_LIBRARIES`, `faustlibraries`
+    in the installed plugin (`install_faust_plugin` reports it as `faust_libraries`: `~/.clap/AutoReaper
+    Faust/faustlibraries`, `~/Library/Audio/Plug-Ins/CLAP/AutoReaper Faust.clap/Contents/Resources/faustlibraries`,
+    `%LOCALAPPDATA%\Programs\Common\CLAP\AutoReaper Faust\faustlibraries`), the folder `faust --dspdir` prints,
+    `/usr/share/faust`, `/usr/local/share/faust`, `/opt/homebrew/share/faust`, `C:\Program Files\Faust\share\faust`.
+    Find candidates by topic, then read one function's documentation:
+
+    ```
+    grep -n '^//-*`(' <dir>/*.lib | grep -i follower        # e.g. `(an.)amp_follower_ar`
+    grep -n -A20 '`(an.)amp_follower_ar`' <dir>/*.lib        # its usage, parameters and code
+    ```
+
+  - For a general Faust primer and idiomatic examples, the user can install Julius O. Smith's Faust skill
+    (`/plugin marketplace add josmithiii/gists`, then `/plugin install faust@josmithiii-gists`).
+- Inputs are main L, R, then sidechain L, R; outputs L, R. A sidechain ducker:
+
+  ```faust
+  import("stdfaust.lib");
+  depth = -9;          // dB while the key is loud
+  threshold = 0.05;    // key level that starts the ducking
+  key(kl, kr) = (abs(kl) + abs(kr)) / 2 : an.amp_follower_ar(0.002, 0.15);
+  gain(kl, kr) = ba.db2linear(depth * (key(kl, kr) > threshold)) : si.smoo;
+  process(l, r, kl, kr) = l * g, r * g with { g = gain(kl, kr); };
+  ```
+
+  Then `sidechain_send` from the key track, `kind: "audio"`, `channels: 3`, `fx: <the effect>`.
+- **MIDI sidechain**: a control marked `[midi:key 36]` is 1 while note 36 is held (velocity / 127), on the exact
+  frame; `[midi:keyon 36]` keeps the last velocity, `[midi:ctrl 1]` follows a CC; add a channel
+  (`[midi:key 36 10]`) to react to one channel only. Route the notes with `sidechain_send` `kind: "midi"`.
+
+  ```faust
+  kick = button("kick [midi:key 36]") > 0;
+  process(l, r, kl, kr) = l * g, r * g with { g = ba.db2linear(-12 * kick) : si.smoo; };
+  ```
+
+  An instrument earlier on the same track receives those notes too and plays them (measured with ReaSynth). Put
+  the Faust effect on a bus the instrument's track feeds and send the MIDI there instead, or use MIDI bus 2 and
+  ask the user to set the Faust plugin's MIDI input bus (pin connector).
+- **Host sync**: controls marked `[host:beat]` (position in quarter notes), `[host:bpm]`, `[host:playing]` (1/0),
+  `[host:bar]` (where the current bar starts, in quarter notes), `[host:num]`, `[host:den]` follow the transport.
+  They change exactly on every 1/48 of a quarter note (and at least every 32 frames), so a step pattern is
+  sample-accurate:
+
+  ```faust
+  beat = nentry("beat [host:beat]", 0, 0, 1e9, 0.0001);
+  playing = nentry("playing [host:playing]", 0, 0, 1, 1);
+  first16 = (beat - floor(beat)) < 0.25;                 // first sixteenth of each quarter note
+  quarter = floor(beat); onbeat = (quarter != quarter') * playing;   // a one-frame impulse per quarter note
+  ```
+
+  Host sync follows the grid even where the drums pause; a sidechain follows the actual hits. Say which you chose.
+- Write settings as named constants with a comment, so the user can read and change them in the window.
+- If the code does not compile, nothing is added (or the edit is not applied) and `messages` has Faust's errors
+  (`faust:<line> : ERROR : ...`, or `faust : <line> : ...` in Faust 2.7x; lines counted from the first line of
+  your code; a message starting with a `.lib` path points into the library, not your code). Fix and retry.
+- To change it, `read_faust_fx` first and pass its `version` to `edit_faust_fx`. A refusal means the user changed
+  the code or is editing it (`draft`): show them what you wanted to change instead of overwriting.
+- Measure the result like any plugin: `capture` before and after, `analyze.py --steps 16` for ducking.
+- If `add_faust_fx` says the plugin is missing, tell the user it is built from the repository's `plugin/` folder.
+
 ## Raw REAPER API for anything else
 
 `reaper_eval` reads and `reaper_eval_write` changes anything the tools above do not cover, for example:

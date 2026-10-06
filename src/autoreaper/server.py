@@ -14,6 +14,7 @@ from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 from pydantic import BaseModel, Field
 
+from . import faust_plugin
 from .bridge import (BRIDGE_SCRIPT_NAME, LUA, PROTOCOL, BridgeError, ReaperBridge, default_reaper_resource_path,
                      home_directory, install_bridge_script, lua_string)
 from .lua_calls import _referenced_reaper_apis
@@ -385,10 +386,11 @@ def fx_program(body, **arguments):
             'local args=' + lua_value(arguments) + '\n' + body)
 
 
-async def fx_write(body, label, **arguments):
+async def fx_write(body, label, program=None, **arguments):
     """Run an FX edit as one Undo step in the active project."""
     status = await asyncio.to_thread(bridge.status)
-    receipt = await bridge.evaluate(fx_program(body, **arguments), project_id=status['project_id'], label=label)
+    receipt = await bridge.evaluate((program or fx_program)(body, **arguments), project_id=status['project_id'],
+                                    label=label)
     if not receipt.get('ok'):
         return {'ok': False, 'error': receipt.get('error'), 'outcome': receipt.get('outcome'),
                 'partial_change_possible': receipt.get('partial_change_possible')}
@@ -698,6 +700,187 @@ async def sidechain_send(
         return output(empty_lists(result, 'pins_before', 'pins_after'), 'sidechain_send')
     except Exception as error:
         return output({'ok': False, 'error': str(error)}, 'sidechain_send')
+
+
+# ----------------------------------------------------------------- Faust
+
+FAUST_MISSING = ('REAPER does not list the "Faust (AutoReaper)" CLAP plugin. Install it with install_faust_plugin '
+                 '(after the user agrees), then the user re-scans plug-ins in REAPER: Options > Preferences > '
+                 'Plug-ins > CLAP > Re-scan, or restarts REAPER.')
+
+FAUST_LISTED = '''
+for i = 0, 19999 do
+  local ok, name, ident = reaper.EnumInstalledFX(i)
+  if not ok then break end
+  if (ident or ''):find('com.autoreaper.faust', 1, true) or name:find('Faust (AutoReaper)', 1, true) then
+    return {listed = true, name = name, ident = ident}
+  end
+end
+return {listed = false}
+'''
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True,
+                                      openWorldHint=True), structured_output=False)
+async def install_faust_plugin(
+        target: Annotated[Literal['windows-x64', 'macos-arm64', 'macos-x64', 'linux-x64'] | None, Field(
+            description="Omit: the package for the running REAPER's system (or this computer's).")] = None,
+        clap_folder: Annotated[str | None, Field(
+            description='Install into this folder instead of the per-user CLAP folder REAPER scans.')] = None,
+        force: Annotated[bool, Field(description='Reinstall even if this version is installed.')] = False) -> str:
+    """Install the "Faust (AutoReaper)" CLAP plugin that add_faust_fx needs: downloads, once, this AutoReaper
+    version's package from GitHub (plugin, libfaust and the Faust libraries; no Faust install needed), checks its
+    SHA-256 and puts it in the user's CLAP folder (Windows %LOCALAPPDATA%\\Programs\\Common\\CLAP, macOS
+    ~/Library/Audio/Plug-Ins/CLAP, Linux ~/.clap). Ask the user before installing. Afterwards REAPER finds it on a
+    plug-in re-scan or restart; the result's next says what the user does."""
+    try:
+        status = bridge.status()
+    except BridgeError:
+        status = {}
+    try:
+        chosen = target or faust_plugin.target_of(status.get('version'))
+        result = await asyncio.to_thread(faust_plugin.install, chosen, Path(clap_folder) if clap_folder else None,
+                                         force)
+    except (faust_plugin.InstallError, OSError) as error:
+        return output({'ok': False, 'changed': False, 'error': str(error)}, 'install_faust_plugin')
+    listed = None
+    if status:
+        try:
+            listed = (await read_query(FAUST_LISTED, 'Find the Faust plugin')).get('listed')
+        except Exception:
+            listed = None
+    if listed and result.get('changed'):
+        result['next'] = 'REAPER knew an earlier copy and may still have it loaded: the user restarts REAPER to use this one.'
+    elif listed:
+        result['next'] = 'REAPER lists the plugin; add_faust_fx works.'
+    else:
+        result['next'] = ('In REAPER the user clicks Options > Preferences > Plug-ins > CLAP > Re-scan (or restarts '
+                          'REAPER); then add_faust_fx works.')
+    return output(result, 'install_faust_plugin')
+
+
+def faust_program(body, **arguments):
+    """fx.lua as `fx`, faust.lua as `faust`, the arguments as `args`, then the body."""
+    return fx_program('local faust=(function()\n' + (LUA / 'faust.lua').read_text(encoding='utf-8') + '\nend)()\n'
+                      + body, **arguments)
+
+
+FAUST_FX_OF = '''
+local function faust_fx(ref_track, ref_fx)
+  local track, track_name = fx.track(ref_track)
+  local index = fx.find(track, ref_fx)
+  assert(faust.is_faust(track, index), 'This FX is not a Faust effect (the Faust (AutoReaper) plugin)')
+  return track, track_name, index
+end
+'''
+
+ADD_FAUST_FX = FAUST_FX_OF + '''
+local track, track_name = fx.track(args.track)
+local position = args.position and (-1000 - args.position) or -1
+local index = reaper.TrackFX_AddByName(track, faust.PLUGIN, false, position)
+if index < 0 then return {ok = false, missing_plugin = true, changed = false} end
+local state = faust.write(track, index, faust.serialize(args.code))
+if state.status ~= 'ok' then
+  reaper.TrackFX_Delete(track, index)
+  return {ok = false, changed = false, messages = state.messages,
+          error = 'Faust did not compile the code; nothing was added. Line numbers count from the first line of the code.'}
+end
+reaper.TrackFX_SetNamedConfigParm(track, index, 'renamed_name', args.name)
+if args.bypassed then reaper.TrackFX_SetEnabled(track, index, false) end
+local result = faust.report(track, index, state)
+result.code, result.track, result.chain, result.changed = nil, track_name, fx.chain(track), true
+return result
+'''
+
+
+@mcp.tool(annotations=FX_WRITE, structured_output=False)
+async def add_faust_fx(
+        track: TrackRef,
+        name: Annotated[str, Field(description='Name shown in the FX chain, e.g. "Lead Ducker".', max_length=60)],
+        code: Annotated[str, Field(description='The complete Faust program: import("stdfaust.lib"); ... process = ...;')],
+        position: Annotated[int | None, Field(ge=0, description='Zero-based position in the chain; omit for the end.')] = None,
+        bypassed: Annotated[bool, Field(description='Insert it bypassed.')] = False) -> str:
+    """Add an effect written in Faust (https://faustdoc.grame.fr) to a track's FX chain, for processing no installed
+    plugin does simply (ducking keyed by another track, utilities, custom filters). It is the "Faust (AutoReaper)"
+    plugin running this code: the project stores the code like any plugin setting, and the plugin window is a code
+    editor where the user can change it and compile. Faust inputs are main L, R, then sidechain L, R (the plugin's
+    Sidechain pins; route a key with sidechain_send kind audio, channels 3, fx <this effect>); outputs are L, R
+    (one output feeds both). MIDI reaches controls marked [midi:key 36], [midi:keyon 36], [midi:ctrl 1] (add a
+    channel: [midi:key 36 10]) on the frame it arrives (sidechain_send kind midi). Controls marked [host:beat]
+    (quarter notes), [host:bpm], [host:playing], [host:bar], [host:num], [host:den] follow REAPER's transport, so
+    floor(beat) changes on the frame where each quarter note starts. Write settings as constants in the code. If
+    the code does not compile nothing is added and Faust's messages are returned. Look up language and library
+    details offline as the reaper skill's plugins.md describes, rather than guessing. One Undo step. Bypass, move
+    or remove it with edit_fx like any plugin."""
+    try:
+        result = await fx_write(ADD_FAUST_FX, f'Add Faust FX {name}', program=faust_program, track=track, name=name,
+                                code=code, position=position, bypassed=bypassed)
+        if result.get('missing_plugin'):
+            result = {'ok': False, 'changed': False, 'error': FAUST_MISSING}
+        return output(empty_lists(result, 'chain'), 'add_faust_fx')
+    except Exception as error:
+        return output({'ok': False, 'error': str(error)}, 'add_faust_fx')
+
+
+READ_FAUST_FX = FAUST_FX_OF + '''
+local track, track_name, index = faust_fx(args.track, args.fx)
+local result = faust.report(track, index, faust.read(track, index))
+result.track = track_name
+return result
+'''
+
+
+@mcp.tool(annotations=READ, structured_output=False)
+async def read_faust_fx(track: TrackRef, fx: FxRef) -> str:
+    """Read a Faust effect: the code it runs, its version (pass it to edit_faust_fx), the last compile's status and
+    Faust's messages, inputs and outputs, and faust_version (the libfaust it compiles with; its manual comes from
+    the reaper skill's faust_docs.py). draft is code the user has changed in the plugin window and not compiled
+    yet; while there is one, edit_faust_fx refuses so the user's work is not overwritten."""
+    try:
+        return output(await read_query(faust_program(READ_FAUST_FX, track=track, fx=fx), 'Read Faust FX'), 'read_faust_fx')
+    except Exception as error:
+        return output({'ok': False, 'error': str(error)}, 'read_faust_fx')
+
+
+EDIT_FAUST_FX = FAUST_FX_OF + '''
+local track, track_name, index = faust_fx(args.track, args.fx)
+local before = faust.read(track, index)
+if before.draft ~= '' then
+  return {ok = false, conflict = true, changed = false, draft = before.draft, code = before.code, version = before.version,
+          error = 'The user is editing this code in the plugin window (changes not compiled yet); nothing was changed. ' ..
+                  'Ask them to compile or discard their changes, then read it again.'}
+end
+if before.version ~= args.version then
+  return {ok = false, conflict = true, changed = false, code = before.code, version = before.version,
+          error = 'The code changed since you read it (the user may have edited it); nothing was changed. Read it again.'}
+end
+local after = faust.write(track, index, faust.serialize(args.code))
+if after.status ~= 'ok' then
+  faust.write(track, index, before.raw)
+  return {ok = false, changed = false, messages = after.messages,
+          error = 'Faust did not compile the code; the effect still runs its previous code. Line numbers count from the first line of the code.'}
+end
+local result = faust.report(track, index, after)
+result.code, result.track, result.changed = nil, track_name, after.code ~= before.code
+return result
+'''
+
+
+@mcp.tool(annotations=FX_WRITE, structured_output=False)
+async def edit_faust_fx(
+        track: TrackRef, fx: FxRef,
+        code: Annotated[str, Field(description='The complete new Faust program.')],
+        version: Annotated[str, Field(description='version from read_faust_fx or add_faust_fx: the code you changed.')]) -> str:
+    """Replace a Faust effect's code; the plugin compiles it at once. Refused, with the current code, when the code
+    changed since the version you read or the user has uncompiled changes in the plugin window. If the new code does
+    not compile, the effect keeps its previous code and Faust's messages are returned. One Undo step (Ctrl+Z
+    restores the previous code)."""
+    try:
+        result = await fx_write(EDIT_FAUST_FX, 'Edit Faust FX', program=faust_program, track=track, fx=fx, code=code,
+                                version=version)
+        return output(result, 'edit_faust_fx')
+    except Exception as error:
+        return output({'ok': False, 'error': str(error)}, 'edit_faust_fx')
 
 
 # ----------------------------------------------------------------- audio

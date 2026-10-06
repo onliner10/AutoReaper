@@ -176,6 +176,8 @@ def test_server_programs_compile():
     for body in (server.ADD_FX, server.FX_PARAMETERS, server.SET_FX_PARAMETERS, server.EDIT_FX, server.SIDECHAIN_SEND,
                  server.RESOLVE_TRACKS):
         assert compile_(server.fx_program(body, track='Bass', fx=0)) is None
+    for body in (server.ADD_FAUST_FX, server.READ_FAUST_FX, server.EDIT_FAUST_FX):
+        assert compile_(server.faust_program(body, track='Lead', fx=0)) is None
 
 
 def test_set_does_not_probe_live_when_formatting_is_reliable(lua):
@@ -217,3 +219,46 @@ def test_note_value_lists_are_matched_as_text(lua):
     assert resolve(lua, 4, '1/8')[1] == '1/8'
     with pytest.raises(lua_module.LuaError, match='settings are: 1/64 | 1/32'):
         resolve(lua, 4, '1/8.')
+
+
+def test_faust_state_round_trip_matches_the_plugin_format():
+    # The state as plugin/src/engine.cpp writes it: sized fields, code with quotes and new lines.
+    code = 'import("stdfaust.lib");\nprocess = _ : *(0.5); // "half"\n'
+    raw = ('AutoReaperFaust 1\nstatus error\ninputs 4\noutputs 2\nmessages 13\nfaust : 2 : x\n'
+           f'code {len(code)}\n{code}\ndraft 13\nprocess = _;\n\n')
+    runtime = lua_module.LuaRuntime(unpack_returned_tuples=True)
+    faust = runtime.execute((LUA / 'faust.lua').read_text(encoding='utf-8'))
+    state = faust.parse(faust.decode(faust.encode(raw)))
+    assert (state.code, state.draft, state.messages, state.status, state.inputs) == (
+        code, 'process = _;\n', 'faust : 2 : x', 'error', 4)
+    written = faust.parse(faust.serialize(code))
+    assert written.code == code and written.draft == '' and written.status == 'none'
+    assert faust.hash(code) == faust.hash(code) != faust.hash(code + ' ')
+    for size in range(5):  # base64 padding
+        assert faust.decode(faust.encode('abcd'[:size])) == 'abcd'[:size]
+
+
+@pytest.mark.parametrize('newline', ['\n', '\r\n'])
+def test_faust_state_in_a_track_chunk(newline):
+    """faust.read/write find the plugin's <STATE> by FX GUID, with Unix or Windows line ends."""
+    runtime = lua_module.LuaRuntime(unpack_returned_tuples=True)
+    faust = runtime.execute((LUA / 'faust.lua').read_text(encoding='utf-8'))
+    code = 'process = _ * 0.5;\n'
+    encoded = faust.encode(faust.serialize(code))
+    lines = ['<TRACK', 'NAME LEAD', '<FXCHAIN', 'BYPASS 0 0 0', '<VST "VSTi: Other" other.so', 'AAAA', '>',
+             'FXID {11111111-0000-0000-0000-000000000000}',
+             '<CLAP "CLAP: Faust (AutoReaper)" com.autoreaper.faust ""', 'CFG 4 0 0 ""', '<STATE',
+             encoded[:40], encoded[40:], '>', '>', 'FXID {22222222-0000-0000-0000-000000000000}', '>', '>']
+    runtime.globals().chunk = newline.join(lines) + newline
+    runtime.execute('''
+      reaper = {
+        GetTrackStateChunk = function() return true, chunk end,
+        SetTrackStateChunk = function(_, c) chunk = c; return true end,
+        TrackFX_GetFXGUID = function() return '{22222222-0000-0000-0000-000000000000}' end,
+        TrackFX_GetNamedConfigParm = function() return true, '/x/AutoReaper Faust.clap<com.autoreaper.faust' end,
+      }''')
+    state = faust.read(None, 1)
+    assert state.code == code and state.status == 'none'
+    after = faust.write(None, 1, faust.serialize('process = _;\n'))
+    assert after.code == 'process = _;\n'
+    assert 'NAME LEAD' in runtime.globals().chunk and 'AAAA' in runtime.globals().chunk  # the rest untouched

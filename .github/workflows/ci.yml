@@ -1,0 +1,84 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  python:
+    name: Server and skill (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv run pytest -q
+
+  plugin:
+    name: Faust plugin (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-14, windows-2022]
+    runs-on: ${{ matrix.os }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Faust (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y faust libx11-dev
+
+      - name: Faust (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install faust
+          echo "FAUST_DIR=$(brew --prefix)" >> "$GITHUB_ENV"
+          echo "AUTOREAPER_FAUST_LIBRARIES=$(brew --prefix)/share/faust" >> "$GITHUB_ENV"
+
+      - name: Faust (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          gh release download --repo grame-cncm/faust --pattern '*win64.exe' --dir "$env:RUNNER_TEMP"
+          $installer = Get-ChildItem "$env:RUNNER_TEMP" -Filter '*win64.exe' | Select-Object -First 1
+          Write-Host "Installing $($installer.Name)"
+          Start-Process $installer.FullName -ArgumentList '/S' -Wait
+          $faust = 'C:\Program Files\Faust'
+          Get-ChildItem $faust -Recurse -Include *.dll, *.lib, llvm-dsp.h, stdfaust.lib | ForEach-Object { $_.FullName }
+          "FAUST_DIR=$faust" >> $env:GITHUB_ENV
+          "AUTOREAPER_FAUST_LIBRARIES=$faust\share\faust" >> $env:GITHUB_ENV
+          "$faust\lib" >> $env:GITHUB_PATH
+          "$faust\bin" >> $env:GITHUB_PATH
+
+      - name: Build
+        shell: bash
+        run: |
+          cmake -S plugin -B plugin/build -DCMAKE_BUILD_TYPE=Release -DFAUST_DIR="${FAUST_DIR:-}"
+          cmake --build plugin/build --config Release --parallel 4
+
+      - name: Test the engine, the window drawing and the plugin as a host loads it
+        shell: bash
+        run: |
+          find_one() { find plugin/build \( -name "$1" -o -name "$1.exe" \) -type f | head -1; }
+          "$(find_one engine_test)"
+          "$(find_one ui_snapshot)" window.ppm && test -s window.ppm
+          plugin=$(find plugin/build -name 'AutoReaper Faust.clap' -prune | head -1)
+          echo "plugin: $plugin"
+          "$(find_one clap_host_test)" "$plugin"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: autoreaper-faust-${{ runner.os }}
+          path: |
+            plugin/build/**/AutoReaper Faust.clap
+            window.ppm
+          if-no-files-found: warn
