@@ -59,14 +59,14 @@ editor triggers actions, enable "Send all keyboard input to plug-in" in the FX w
 
 ## Status
 
-| | Linux | Windows | macOS |
+| | Linux | macOS | Windows |
 |---|---|---|---|
-| Audio, state, compiling | tested in REAPER 7.81 | not built yet | not built yet |
-| Window (editor) | tested in REAPER 7.81 (X11) | to do: a Win32 child window | to do: an NSView |
+| Builds; engine test (ducking, MIDI and beat timing to the frame); the plugin loaded as a host loads it (ports, state, sidechain ducking, compile errors); the window drawn | CI, Faust 2.70.3 | CI (arm64), Faust 2.85.9 | CI (x64), Faust 2.88.0 |
+| The window in a host: editing, keyboard, clipboard, Compile, errors | tested in REAPER 7.81 | written, not yet tried in a host | written, not yet tried in a host |
+| In REAPER: project save and reopen, AutoReaper's tools, sidechains | tested in REAPER 7.81 | not yet tried | not yet tried |
 
-The window draws in software (ImGui's triangles into a bitmap, `src/gui/raster.cpp`), so another platform needs
-only a child window that shows the bitmap and passes on mouse, keyboard and clipboard (`src/gui/x11_window.cpp`
-is the Linux one). Shipping it to users also needs libfaust bundled beside the plugin with the Faust libraries.
+The plugin uses the Faust installed on the computer (libfaust and its libraries). A release for users would
+bundle libfaust and the libraries beside the plugin instead; that is not done yet.
 
 ## State format
 

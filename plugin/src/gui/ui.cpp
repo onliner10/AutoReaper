@@ -39,18 +39,24 @@ const TextEditor::LanguageDefinition& faust_language() {
     return language;
 }
 
-// "faust : 3 : ERROR : undefined symbol : foo" -> line 3 (lines of library
-// files start with their path instead of "faust").
-TextEditor::ErrorMarkers markers(const std::string& messages) {
-    TextEditor::ErrorMarkers result;
+}  // namespace
+
+// Faust names the user's code "faust": "faust:3 : ERROR : undefined symbol : foo"
+// (Faust 2.7x writes "faust : 3 : ..."). Lines of library files start with
+// their path instead, and are not the user's lines.
+std::map<int, std::string> error_lines(const std::string& messages) {
+    std::map<int, std::string> result;
     std::istringstream lines(messages);
     std::string line;
     while (std::getline(lines, line)) {
-        if (line.rfind("faust : ", 0) != 0) continue;
-        const size_t colon = 5;
+        if (line.rfind("faust", 0) != 0) continue;
+        size_t at = line.find_first_not_of(' ', 5);
+        if (at == std::string::npos || line[at] != ':') continue;
+        at = line.find_first_not_of(' ', at + 1);
+        if (at == std::string::npos) continue;
         char* end = nullptr;
-        const long number = std::strtol(line.c_str() + colon + 3, &end, 10);
-        if (number <= 0 || end == line.c_str() + colon + 3) continue;
+        const long number = std::strtol(line.c_str() + at, &end, 10);
+        if (number <= 0 || end == line.c_str() + at) continue;
         std::string message = line.substr(end - line.c_str());
         message.erase(0, message.find_first_not_of(" :"));
         std::string& text = result[int(number)];
@@ -58,6 +64,8 @@ TextEditor::ErrorMarkers markers(const std::string& messages) {
     }
     return result;
 }
+
+namespace {
 
 ImGuiKey imgui_key(Key key) {
     switch (key) {
@@ -170,7 +178,8 @@ UiAction Ui::frame(const UiModel& model, double seconds) {
     const std::string marked = model.status == "error" ? model.messages : "";
     if (marked != marked_messages_) {
         marked_messages_ = marked;
-        editor_->SetErrorMarkers(markers(marked));
+        const auto lines = error_lines(marked);
+        editor_->SetErrorMarkers(TextEditor::ErrorMarkers(lines.begin(), lines.end()));
     }
 
     UiAction action = UiAction::None;

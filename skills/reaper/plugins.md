@@ -144,7 +144,8 @@ track, a gain or filter utility, a gate, a custom envelope. Prefer the standard 
   Host sync follows the grid even where the drums pause; a sidechain follows the actual hits. Say which you chose.
 - Write settings as named constants with a comment, so the user can read and change them in the window.
 - If the code does not compile, nothing is added (or the edit is not applied) and `messages` has Faust's errors
-  (`faust : <line> : ERROR : ...`, lines counted from the first line of your code). Fix and retry.
+  (`faust:<line> : ERROR : ...`, or `faust : <line> : ...` in Faust 2.7x; lines counted from the first line of
+  your code; a message starting with a `.lib` path points into the library, not your code). Fix and retry.
 - To change it, `read_faust_fx` first and pass its `version` to `edit_faust_fx`. A refusal means the user changed
   the code or is editing it (`draft`): show them what you wanted to change instead of overwriting.
 - Measure the result like any plugin: `capture` before and after, `analyze.py --steps 16` for ducking.

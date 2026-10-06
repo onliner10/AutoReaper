@@ -6,6 +6,7 @@
 #include "raster.h"
 
 #include <functional>
+#include <map>
 #include <memory>
 #include <string>
 
@@ -34,6 +35,9 @@ struct Clipboard {
     std::function<std::string()> get;
     std::function<void(const std::string&)> set;
 };
+
+// The lines of the user's code that Faust's messages point at, with the messages.
+std::map<int, std::string> error_lines(const std::string& messages);
 
 class Ui {
 public:
