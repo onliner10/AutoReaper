@@ -53,6 +53,9 @@ std::vector<std::string> library_paths(const std::string& plugin_dir);
 
 CompileResult compile(const std::string& code, double sample_rate, const std::vector<std::string>& libraries);
 
+// The LLVM target compile() asks libfaust for ("triple:cpu"; empty: the host's).
+std::string jit_target();
+
 // The host's transport at the first frame of a block.
 struct Transport {
     bool playing = false;

@@ -84,6 +84,11 @@ jobs:
           run() { if [ "${{ matrix.arch }}" = x86_64 ]; then arch -x86_64 "$@"; else "$@"; fi; }
           find_one() { find build \( -name "$1" -o -name "$1.exe" \) -type f | head -1; }
           export AUTOREAPER_FAUST_LIBRARIES="$FAUST_ROOT/share/faust"
+          case "$RUNNER_OS" in
+            Windows) powershell -Command "(Get-CimInstance Win32_Processor).Name" ;;
+            macOS) sysctl -n machdep.cpu.brand_string ;;
+            *) grep -m1 'model name' /proc/cpuinfo ;;
+          esac
           run "$(find_one engine_test)"
 
       - name: Package

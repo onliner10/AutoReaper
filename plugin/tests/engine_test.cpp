@@ -2,6 +2,8 @@
 #define _USE_MATH_DEFINES  // M_PI on Windows
 #include "../src/engine.h"
 
+#include <faust/dsp/llvm-dsp.h>
+
 #include <cmath>
 #include <cstdio>
 #include <vector>
@@ -31,6 +33,9 @@ static float rms(const std::vector<float>& x, int from, int to) {
 }
 
 int main() {
+    std::printf("libfaust %s, host target %s, compiling for %s\n", faust_version().c_str(),
+                getDSPMachineTarget().c_str(), jit_target().c_str());
+    std::fflush(stdout);
     const auto libraries = library_paths("");
     CHECK(!libraries.empty());
 

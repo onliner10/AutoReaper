@@ -12,6 +12,12 @@
 #include <filesystem>
 #include <sstream>
 
+#if defined(_M_X64)
+#include <intrin.h>
+#elif defined(__x86_64__)
+#include <cpuid.h>
+#endif
+
 // Faust's GUI keeps a list of every GUI (MidiUI is one); defined once here.
 std::list<GUI*> GUI::fGuiList;
 ztimedmap GUI::gTimedZoneMap;
@@ -54,6 +60,31 @@ struct HostZonesUI : public UI {
     void addSoundfile(const char*, const char*, Soundfile**) override {}
 };
 
+#if defined(_M_X64) || defined(__x86_64__)
+// AVX2 and FMA, with the OS saving the AVX registers (a VM can hide them).
+bool avx2_usable() {
+    unsigned int a, b, c, d;
+#if defined(_M_X64)
+    int r[4];
+    __cpuid(r, 1);
+    c = unsigned(r[2]);
+    if (!(c & (1u << 27)) || !(c & (1u << 28)) || !(c & (1u << 12))) return false;  // OSXSAVE, AVX, FMA
+    if ((_xgetbv(0) & 6) != 6) return false;                                          // XMM and YMM state
+    __cpuidex(r, 7, 0);
+    b = unsigned(r[1]);
+    (void)a; (void)d;
+#else
+    if (!__get_cpuid(1, &a, &b, &c, &d)) return false;
+    if (!(c & (1u << 27)) || !(c & (1u << 28)) || !(c & (1u << 12))) return false;
+    unsigned int low, high;
+    __asm__("xgetbv" : "=a"(low), "=d"(high) : "c"(0));
+    if ((low & 6) != 6) return false;
+    if (!__get_cpuid_count(7, 0, &a, &b, &c, &d)) return false;
+#endif
+    return (b & (1u << 5)) != 0;  // AVX2
+}
+#endif
+
 void set_all(const std::vector<float*>& zones, double value) {
     for (float* zone : zones) *zone = float(value);
 }
@@ -70,6 +101,19 @@ Program::~Program() {
     midi.reset();
     delete instance;  // before its factory
     if (factory) deleteDSPFactory(factory);
+}
+
+// libfaust's default JIT target names the host's CPU model, and LLVM then uses
+// every instruction of that model, even ones this machine does not enable
+// (AVX-512 hidden by a VM, say): the code crashes with an illegal instruction.
+// On x86-64 ask for an ISA level the CPU and OS actually support instead.
+std::string jit_target() {
+#if defined(_M_X64) || defined(__x86_64__)
+    const std::string host = getDSPMachineTarget();
+    return host.substr(0, host.find(':')) + (avx2_usable() ? ":x86-64-v3" : ":x86-64-v2");
+#else
+    return "";  // the host's own target
+#endif
 }
 
 std::vector<std::string> library_paths(const std::string& plugin_dir) {
@@ -96,7 +140,7 @@ CompileResult compile(const std::string& code, double sample_rate, const std::ve
         argv.push_back(path.c_str());
     }
     std::string error;
-    llvm_dsp_factory* factory = createDSPFactoryFromString("faust", code, int(argv.size()), argv.data(), "", error, -1);
+    llvm_dsp_factory* factory = createDSPFactoryFromString("faust", code, int(argv.size()), argv.data(), jit_target(), error, -1);
     if (!factory) {
         result.messages = error.empty() ? "Faust could not compile the code." : error;
         return result;
