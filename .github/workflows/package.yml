@@ -1,0 +1,138 @@
+name: Package the Faust plugin
+
+# Builds "AutoReaper Faust" with the official Faust release's libfaust (LLVM
+# included) and packages both, with the Faust libraries, for each system; then
+# tests each package on a clean runner without Faust.
+
+on:
+  push:
+  workflow_dispatch:
+
+env:
+  FAUST_VERSION: 2.88.0
+
+jobs:
+  package:
+    name: Package (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {target: linux-x64, os: ubuntu-22.04}
+          - {target: macos-arm64, os: macos-14, arch: arm64}
+          - {target: macos-x64, os: macos-14, arch: x86_64}
+          - {target: windows-x64, os: windows-2022}
+    runs-on: ${{ matrix.os }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Faust release (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -q && sudo apt-get install -y -q libx11-dev
+          gh release download "$FAUST_VERSION" --repo grame-cncm/faust --pattern 'libfaust-ubuntu-x86_64.zip' --pattern "faust-$FAUST_VERSION.tar.gz"
+          unzip -q libfaust-ubuntu-x86_64.zip -d libfaust
+          tar xzf "faust-$FAUST_VERSION.tar.gz"
+          root="$PWD/faust-root"
+          mkdir -p "$root/lib" "$root/include" "$root/share"
+          cp -a libfaust/lib/libfaust.so* "$root/lib/"
+          cp -a "faust-$FAUST_VERSION/architecture/faust" "$root/include/faust"
+          mkdir -p "$root/share/faust" && cp "faust-$FAUST_VERSION"/libraries/*.lib "$root/share/faust/"
+          cp "faust-$FAUST_VERSION/COPYING.txt" "$root/" 2>/dev/null || true
+          ls "$root/lib" "$root/include/faust/dsp" | head; ls "$root/share/faust" | wc -l
+          echo "glibc needed by libfaust: $(objdump -T $root/lib/libfaust.so* | grep -o 'GLIBC_[0-9.]*' | sort -V | tail -1)"
+          echo "FAUST_ROOT=$root" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=$root/lib" >> "$GITHUB_ENV"
+
+      - name: Faust release (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          dmg_arch=${{ matrix.arch == 'x86_64' && 'x64' || 'arm64' }}
+          gh release download "$FAUST_VERSION" --repo grame-cncm/faust --pattern "Faust-$FAUST_VERSION-$dmg_arch.dmg"
+          hdiutil attach "Faust-$FAUST_VERSION-$dmg_arch.dmg" -mountpoint /Volumes/faust -nobrowse -quiet
+          cp -R "/Volumes/faust/Faust-$FAUST_VERSION" faust-root
+          hdiutil detach /Volumes/faust -quiet
+          ls faust-root faust-root/lib; lipo -info faust-root/lib/libfaust.$FAUST_VERSION.dylib
+          echo "FAUST_ROOT=$PWD/faust-root" >> "$GITHUB_ENV"
+
+      - name: Faust release (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          gh release download $env:FAUST_VERSION --repo grame-cncm/faust --pattern "Faust-$env:FAUST_VERSION-win64.exe" --dir "$env:RUNNER_TEMP"
+          Start-Process "$env:RUNNER_TEMP\Faust-$env:FAUST_VERSION-win64.exe" -ArgumentList '/S' -Wait
+          Get-ChildItem 'C:\Program Files\Faust' | ForEach-Object { $_.Name }
+          "FAUST_ROOT=C:\Program Files\Faust" >> $env:GITHUB_ENV
+          "C:\Program Files\Faust\lib" >> $env:GITHUB_PATH
+
+      - name: Build
+        shell: bash
+        run: |
+          extra=()
+          [ -n "${{ matrix.arch }}" ] && extra+=("-DCMAKE_OSX_ARCHITECTURES=${{ matrix.arch }}")
+          cmake -S plugin -B build -DCMAKE_BUILD_TYPE=Release -DAUTOREAPER_PACKAGE=ON -DFAUST_DIR="$FAUST_ROOT" "${extra[@]}"
+          cmake --build build --config Release --parallel 4
+
+      - name: Test the build
+        shell: bash
+        run: |
+          run() { if [ "${{ matrix.arch }}" = x86_64 ]; then arch -x86_64 "$@"; else "$@"; fi; }
+          find_one() { find build \( -name "$1" -o -name "$1.exe" \) -type f | head -1; }
+          export AUTOREAPER_FAUST_LIBRARIES="$FAUST_ROOT/share/faust"
+          run "$(find_one engine_test)"
+
+      - name: Package
+        shell: bash
+        run: python plugin/package.py --build build --faust "$FAUST_ROOT" --out dist --name "autoreaper-faust-${{ matrix.target }}"
+
+      - name: Keep the host test for the clean runner
+        shell: bash
+        run: |
+          mkdir -p tools
+          cp "$(find build \( -name clap_host_test -o -name clap_host_test.exe \) -type f | head -1)" tools/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: autoreaper-faust-${{ matrix.target }}
+          path: dist/autoreaper-faust-${{ matrix.target }}.zip
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: host-test-${{ matrix.target }}
+          path: tools/
+
+  clean-test:
+    name: Package on a clean ${{ matrix.target }} runner
+    needs: package
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {target: linux-x64, os: ubuntu-24.04}
+          - {target: macos-arm64, os: macos-14}
+          - {target: macos-x64, os: macos-14, rosetta: true}
+          - {target: windows-x64, os: windows-2022}
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with: {name: "autoreaper-faust-${{ matrix.target }}"}
+      - uses: actions/download-artifact@v4
+        with: {name: "host-test-${{ matrix.target }}", path: tools}
+      - name: No Faust on this runner
+        shell: bash
+        run: |
+          ! command -v faust
+          for dir in /usr/share/faust /usr/local/share/faust /opt/homebrew/share/faust "/c/Program Files/Faust"; do
+            test ! -e "$dir" || { echo "Faust found at $dir"; exit 1; }
+          done
+      - name: Unpack and load the plugin as a host does
+        shell: bash
+        run: |
+          unzip -q "autoreaper-faust-${{ matrix.target }}.zip"
+          find "AutoReaper Faust" -maxdepth 3 | head -20
+          cat "AutoReaper Faust/INSTALL.txt"
+          chmod +x tools/clap_host_test* || true
+          if [ "${{ matrix.rosetta }}" = true ]; then arch -x86_64 tools/clap_host_test "AutoReaper Faust/AutoReaper Faust.clap"
+          else tools/clap_host_test* "AutoReaper Faust/AutoReaper Faust.clap"; fi

@@ -73,6 +73,21 @@ else()
     set_target_properties(autoreaper_faust PROPERTIES PREFIX "" SUFFIX ".clap")
 endif()
 
+# A package for users carries libfaust beside the plugin (plugin/package.py):
+# load it from there, never from where it was built.
+option(AUTOREAPER_PACKAGE "Find libfaust beside the plugin (for plugin/package.py)" OFF)
+if(AUTOREAPER_PACKAGE)
+    if(WIN32)
+        target_link_options(autoreaper_faust PRIVATE "/DELAYLOAD:faust.dll")
+        target_link_libraries(autoreaper_faust PRIVATE delayimp)
+    elseif(APPLE)
+        set_target_properties(autoreaper_faust PROPERTIES BUILD_WITH_INSTALL_RPATH TRUE
+                              INSTALL_RPATH "@loader_path/../Frameworks")
+    else()
+        set_target_properties(autoreaper_faust PROPERTIES BUILD_WITH_INSTALL_RPATH TRUE INSTALL_RPATH "$ORIGIN")
+    endif()
+endif()
+
 # Headless checks: the engine and state format, and a picture of the window.
 add_executable(engine_test tests/engine_test.cpp)
 target_link_libraries(engine_test PRIVATE autoreaper_faust_engine)

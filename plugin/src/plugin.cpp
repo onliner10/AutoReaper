@@ -492,7 +492,24 @@ const clap_plugin_descriptor_t* factory_descriptor(const clap_plugin_factory_t*,
 
 const clap_plugin_factory_t kFactory = {factory_count, factory_descriptor, create_plugin};
 
-bool entry_init(const char*) { return true; }
+// A packaged plugin keeps faust.dll beside it and links it delay-loaded:
+// load it from there before the first libfaust call, so it need not be on
+// PATH. Elsewhere the loader finds libfaust through the plugin's rpath.
+bool entry_init(const char* plugin_path) {
+#ifdef _WIN32
+    if (GetModuleHandleW(L"faust.dll")) return true;
+    std::string folder = plugin_path ? plugin_path : "";
+    folder = folder.substr(0, folder.find_last_of("\\/") == std::string::npos ? 0 : folder.find_last_of("\\/"));
+    const std::string dll = folder + "\\faust.dll";
+    std::wstring wide(MultiByteToWideChar(CP_UTF8, 0, dll.c_str(), -1, nullptr, 0), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, dll.c_str(), -1, wide.data(), int(wide.size()));
+    if (!folder.empty() && LoadLibraryExW(wide.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH)) return true;
+    return LoadLibraryW(L"faust.dll") != nullptr;  // a Faust install on PATH
+#else
+    (void)plugin_path;
+    return true;
+#endif
+}
 void entry_deinit() {}
 const void* entry_factory(const char* id) { return std::strcmp(id, CLAP_PLUGIN_FACTORY_ID) ? nullptr : &kFactory; }
 
