@@ -2,6 +2,7 @@
 // plugin windows then need only a way to show a bitmap on each platform.
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <vector>
 
@@ -16,7 +17,7 @@ struct Bitmap {
     void resize(int w, int h) {
         width = w;
         height = h;
-        pixels.assign(size_t(w) * h, 0);
+        pixels.assign(std::size_t(w) * h, 0);
     }
 };
 
