@@ -188,12 +188,15 @@ void run(Program& program, const float* const* inputs, int input_count, float* c
 
 void reset(Program& program) { program.instance->instanceClear(); }
 
+std::string faust_version() { return getCLibFaustVersion(); }
+
 // Text with sized fields, so code and messages need no escaping:
-//   AutoReaperFaust 1 / status ok / inputs 4 / outputs 2 / messages <n>\n<n bytes> / code <n>\n<n bytes>
+//   AutoReaperFaust 1 / faust 2.70.3 / status ok / inputs 4 / outputs 2 / messages <n>\n<n bytes> / code <n>\n<n bytes>
 //   / draft <n>\n<n bytes> (only while there is one)
 std::string serialize(const State& state) {
     std::ostringstream out;
     out << "AutoReaperFaust 1\n"
+        << "faust " << faust_version() << "\n"
         << "status " << state.status << "\n"
         << "inputs " << state.inputs << "\n"
         << "outputs " << state.outputs << "\n"

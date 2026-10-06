@@ -56,6 +56,7 @@ Text with sized fields, so code needs no escaping (`src/engine.cpp`):
 
 ```
 AutoReaperFaust 1
+faust <version>        (the libfaust that compiled it; informative)
 status ok|error|none
 inputs <n>
 outputs <n>

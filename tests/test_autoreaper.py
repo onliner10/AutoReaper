@@ -246,3 +246,25 @@ def test_analyze_steps_show_what_plays_on_the_beat(tmp_path, capsys):
     step_diff = next(line for line in lines if line.startswith('# difference per step'))
     first = lines[lines.index(step_diff) + 2]
     assert first.startswith('1.1 ') and float(first.split()[2]) == pytest.approx(6.0, abs=0.1)  # low band
+
+
+_docs_spec = importlib.util.spec_from_file_location(
+    'faust_docs', Path(__file__).parents[1] / 'skills' / 'reaper' / 'scripts' / 'faust_docs.py')
+faust_docs = importlib.util.module_from_spec(_docs_spec)
+_docs_spec.loader.exec_module(faust_docs)
+
+
+def test_faust_docs_reads_the_cache_without_network(tmp_path, monkeypatch, capsys):
+    assert sorted(['2.72.13', '2.70.3', '2.8.0'], key=faust_docs.version_key) == ['2.8.0', '2.70.3', '2.72.13']
+    folder = tmp_path / 'faust-docs' / '2.70.3'
+    folder.mkdir(parents=True)
+    for name in ('SOURCE.md', 'syntax.md', 'midi.md', 'errors.md'):
+        (folder / name).write_text('x', encoding='utf-8')
+    monkeypatch.setenv('AUTOREAPER_HOME', str(tmp_path))
+    monkeypatch.setattr(faust_docs.subprocess, 'run', lambda *a, **k: pytest.fail('no git or faust when cached'))
+    monkeypatch.setattr('sys.argv', ['faust_docs.py', '--version', '2.70.3 (LLVM 17.0.6)'])
+    faust_docs.main()
+    assert capsys.readouterr().out.strip() == str(folder)
+    monkeypatch.setattr('sys.argv', ['faust_docs.py', '--version', 'latest'])
+    with pytest.raises(SystemExit):
+        faust_docs.main()

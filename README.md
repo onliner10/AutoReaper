@@ -53,8 +53,9 @@ plugin's settings, Undo restores earlier code, and the project plays on another 
 The plugin window is a code editor where you can read and change the code and click Compile; Faust's errors show
 on their lines. Effects can listen to a sidechain (audio on the plugin's Sidechain pins, or MIDI notes and CCs)
 and follow REAPER's transport (beat, tempo, bar) to react on every quarter note. Claude looks up Faust offline: the
-skill includes the Faust manual's language, MIDI and error pages ([`skills/reaper/faust`](skills/reaper/faust)),
-and the standard library documents itself in the `.lib` files that come with Faust. The plugin is built from source for now and tested on Linux (see its README).
+skill's `scripts/faust_docs.py` downloads the Faust manual's language, MIDI and error pages once, as they were for
+the Faust version the plugin uses, into `~/.autoreaper/faust-docs`; the standard library documents itself in the
+`.lib` files that come with Faust. The plugin is built from source for now and tested on Linux (see its README).
 
 ## Requirements
 
@@ -137,6 +138,7 @@ Everything AutoReaper writes is under `~/.autoreaper` (`%USERPROFILE%\.autoreape
 |---|---|
 | `bridge/` | Request and receipt files, heartbeat, `bridge-errors.log` |
 | `captures/` | Rendered WAVs, their `.json` bar grids and spectrogram PNGs |
+| `faust-docs/` | Faust manual pages per Faust version, downloaded once by the skill's `faust_docs.py` |
 | `backups/` | Project copies made before edits |
 | `results/` | Tool results too large to show inline |
 

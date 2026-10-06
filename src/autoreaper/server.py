@@ -782,7 +782,8 @@ return result
 @mcp.tool(annotations=READ, structured_output=False)
 async def read_faust_fx(track: TrackRef, fx: FxRef) -> str:
     """Read a Faust effect: the code it runs, its version (pass it to edit_faust_fx), the last compile's status and
-    Faust's messages, inputs and outputs. draft is code the user has changed in the plugin window and not compiled
+    Faust's messages, inputs and outputs, and faust_version (the libfaust it compiles with; its manual comes from
+    the reaper skill's faust_docs.py). draft is code the user has changed in the plugin window and not compiled
     yet; while there is one, edit_faust_fx refuses so the user's work is not overwritten."""
     try:
         return output(await read_query(faust_program(READ_FAUST_FX, track=track, fx=fx), 'Read Faust FX'), 'read_faust_fx')

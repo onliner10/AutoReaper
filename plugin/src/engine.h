@@ -90,6 +90,9 @@ struct State {
     int outputs = 0;
 };
 
+// The libfaust version the plugin compiles with, e.g. "2.70.3".
+std::string faust_version();
+
 std::string serialize(const State& state);
 bool deserialize(const std::string& data, State& state);
 

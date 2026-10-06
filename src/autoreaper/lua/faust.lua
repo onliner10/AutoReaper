@@ -115,6 +115,7 @@ end
 -- What the tools report about a Faust effect.
 function faust.report(track, index, state)
   return {fx = fx.describe(track, index), code = state.code, version = state.version, status = state.status,
+          faust_version = state.faust,
           messages = state.messages ~= '' and state.messages or nil, inputs = state.inputs, outputs = state.outputs,
           draft = state.draft ~= '' and state.draft or nil}
 end
