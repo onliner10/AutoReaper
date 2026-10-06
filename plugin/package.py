@@ -9,7 +9,7 @@ finds libfaust beside itself. The result is a zip holding, per system:
     Windows  AutoReaper Faust/  AutoReaper Faust.clap, faust.dll, faustlibraries/
     Linux    AutoReaper Faust/  AutoReaper Faust.clap, libfaust.so.N, faustlibraries/
     macOS    AutoReaper Faust.clap  (a bundle: Contents/Frameworks/libfaust.2.dylib,
-                                     Contents/Resources/faustlibraries; signed ad hoc)
+                                     Contents/Resources/faustlibraries and the notes; signed ad hoc)
 
 Each lands in the folder where REAPER looks for CLAP plugins; see plugin/README.md.
 """
@@ -119,9 +119,17 @@ def package_macos(build, faust, folder):
     if target.name not in linked:
         sys.exit(f'The plugin does not link {target.name}:\n{linked}')
     faust_libraries(faust, bundle / 'Contents' / 'Resources' / 'faustlibraries')
-    run('codesign', '--force', '--sign', '-', str(target))
-    run('codesign', '--force', '--deep', '--sign', '-', str(bundle))
     return folder
+
+
+def sign_macos(folder):
+    """Copy the notes into the bundle, which install_faust_plugin installs alone, then sign it ad hoc."""
+    bundle = folder / f'{NAME}.clap'
+    for name in ('INSTALL.txt', 'LICENSE', 'LICENSE-faust'):
+        shutil.copy2(folder / name, bundle / 'Contents' / 'Resources' / name)
+    for library in (bundle / 'Contents' / 'Frameworks').iterdir():
+        run('codesign', '--force', '--sign', '-', str(library))
+    run('codesign', '--force', '--deep', '--sign', '-', str(bundle))
 
 
 def main():
@@ -151,6 +159,8 @@ def main():
                                                        item=item, notes=notes), encoding='utf-8')
     shutil.copy2(REPOSITORY / 'LICENSE', folder / 'LICENSE')
     faust_license(args.faust, folder)
+    if sys.platform == 'darwin':
+        sign_macos(folder)
     name = args.name or f'autoreaper-faust-{version}-{sys.platform}'
     archive = args.out / f'{name}.zip'
     archive.unlink(missing_ok=True)

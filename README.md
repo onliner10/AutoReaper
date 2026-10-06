@@ -28,6 +28,7 @@ It has two parts:
 | `edit_fx` | Bypass, enable, offline, remove, move or show a plugin |
 | `sidechain_send` | Audio sidechain (send, track channels, plugin pins) or MIDI trigger send on a MIDI bus |
 | `capture` | Renders a bar or time range (full mix or tracks soloed by GUID or name) offline to a WAV |
+| `install_faust_plugin` | Downloads the Faust plugin for your system from this repository's release and installs it for REAPER |
 | `add_faust_fx` | Adds an effect written in Faust (needs the Faust plugin below); nothing is added if it does not compile |
 | `read_faust_fx` | A Faust effect's code, version, compile status and messages, and the user's uncompiled changes |
 | `edit_faust_fx` | Replaces a Faust effect's code; refused if the code changed since it was read or the user is editing it |
@@ -55,7 +56,13 @@ on their lines. Effects can listen to a sidechain (audio on the plugin's Sidecha
 and follow REAPER's transport (beat, tempo, bar) to react on every quarter note. Claude looks up Faust offline: the
 skill's `scripts/faust_docs.py` downloads the Faust manual's language, MIDI and error pages once, as they were for
 the Faust version the plugin uses, into `~/.autoreaper/faust-docs`; the standard library documents itself in the
-`.lib` files that come with Faust. The plugin is built from source for now and tested on Linux (see its README).
+`.lib` files that come with the plugin.
+
+Claude installs the plugin with `install_faust_plugin` when you agree: it downloads the package for your system
+(Windows x64, macOS Apple silicon or Intel, Linux x64) once from this repository's release, with libfaust and the
+Faust libraries included, so Faust itself is not needed. It checks the package's SHA-256 and puts it in your CLAP
+folder; then re-scan plug-ins in REAPER (Options > Preferences > Plug-ins > CLAP > Re-scan) or restart REAPER. To
+install by hand or build it yourself, see [`plugin/README.md`](plugin/README.md).
 
 ## Requirements
 

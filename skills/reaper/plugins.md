@@ -80,7 +80,9 @@ MIDI triggering follows the actual kick notes. Say which one you chose and why.
 ## Faust effects
 
 When no installed plugin does the job simply, and the user agrees, write the effect in Faust with
-`add_faust_fx`. It runs in the Faust (AutoReaper) plugin; the user sees and edits the code in its window, and the
+`add_faust_fx`. If it says REAPER does not list the plugin, offer to install it with `install_faust_plugin` (it
+downloads about 15-40 MB once); then the user re-scans plug-ins in REAPER or restarts it, as the result's `next`
+says. It runs in the Faust (AutoReaper) plugin; the user sees and edits the code in its window, and the
 project stores it. Use it for small, precise processing you can state in a few lines: a ducker keyed by another
 track, a gain or filter utility, a gate, a custom envelope. Prefer the standard library (`import("stdfaust.lib");`:
 `an.amp_follower_ar`, `ba.db2linear`, `si.smoo`, `fi.lowpass`, `co.compressor_stereo`, ...).
@@ -94,9 +96,11 @@ track, a gain or filter utility, a gate, a custom envelope. Prefer the standard 
     file. If it cannot download, say so and rely on the library documentation below.
   - The standard library: the `.lib` files the plugin compiles with document every function (usage, parameters,
     units), so they always match. They are in the first of: `AUTOREAPER_FAUST_LIBRARIES`, `faustlibraries`
-    beside the plugin, the folder `faust --dspdir` prints, `/usr/share/faust`, `/usr/local/share/faust`,
-    `/opt/homebrew/share/faust`, `C:\Program Files\Faust\share\faust`. Find candidates by topic, then read one
-    function's documentation:
+    in the installed plugin (`install_faust_plugin` reports it as `faust_libraries`: `~/.clap/AutoReaper
+    Faust/faustlibraries`, `~/Library/Audio/Plug-Ins/CLAP/AutoReaper Faust.clap/Contents/Resources/faustlibraries`,
+    `%LOCALAPPDATA%\Programs\Common\CLAP\AutoReaper Faust\faustlibraries`), the folder `faust --dspdir` prints,
+    `/usr/share/faust`, `/usr/local/share/faust`, `/opt/homebrew/share/faust`, `C:\Program Files\Faust\share\faust`.
+    Find candidates by topic, then read one function's documentation:
 
     ```
     grep -n '^//-*`(' <dir>/*.lib | grep -i follower        # e.g. `(an.)amp_follower_ar`

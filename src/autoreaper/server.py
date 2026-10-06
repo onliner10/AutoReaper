@@ -14,6 +14,7 @@ from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 from pydantic import BaseModel, Field
 
+from . import faust_plugin
 from .bridge import (BRIDGE_SCRIPT_NAME, LUA, PROTOCOL, BridgeError, ReaperBridge, default_reaper_resource_path,
                      home_directory, install_bridge_script, lua_string)
 from .lua_calls import _referenced_reaper_apis
@@ -703,9 +704,59 @@ async def sidechain_send(
 
 # ----------------------------------------------------------------- Faust
 
-FAUST_MISSING = ('The "Faust (AutoReaper)" CLAP plugin is not installed in REAPER. It is built from the plugin/ '
-                 'folder of the AutoReaper repository (see plugin/README.md); after installing it, REAPER finds it '
-                 'on its next plugin scan (Options > Preferences > Plug-ins > CLAP > Re-scan).')
+FAUST_MISSING = ('REAPER does not list the "Faust (AutoReaper)" CLAP plugin. Install it with install_faust_plugin '
+                 '(after the user agrees), then the user re-scans plug-ins in REAPER: Options > Preferences > '
+                 'Plug-ins > CLAP > Re-scan, or restarts REAPER.')
+
+FAUST_LISTED = '''
+for i = 0, 19999 do
+  local ok, name, ident = reaper.EnumInstalledFX(i)
+  if not ok then break end
+  if (ident or ''):find('com.autoreaper.faust', 1, true) or name:find('Faust (AutoReaper)', 1, true) then
+    return {listed = true, name = name, ident = ident}
+  end
+end
+return {listed = false}
+'''
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True,
+                                      openWorldHint=True), structured_output=False)
+async def install_faust_plugin(
+        target: Annotated[Literal['windows-x64', 'macos-arm64', 'macos-x64', 'linux-x64'] | None, Field(
+            description="Omit: the package for the running REAPER's system (or this computer's).")] = None,
+        clap_folder: Annotated[str | None, Field(
+            description='Install into this folder instead of the per-user CLAP folder REAPER scans.')] = None,
+        force: Annotated[bool, Field(description='Reinstall even if this version is installed.')] = False) -> str:
+    """Install the "Faust (AutoReaper)" CLAP plugin that add_faust_fx needs: downloads, once, this AutoReaper
+    version's package from GitHub (plugin, libfaust and the Faust libraries; no Faust install needed), checks its
+    SHA-256 and puts it in the user's CLAP folder (Windows %LOCALAPPDATA%\\Programs\\Common\\CLAP, macOS
+    ~/Library/Audio/Plug-Ins/CLAP, Linux ~/.clap). Ask the user before installing. Afterwards REAPER finds it on a
+    plug-in re-scan or restart; the result's next says what the user does."""
+    try:
+        status = bridge.status()
+    except BridgeError:
+        status = {}
+    try:
+        chosen = target or faust_plugin.target_of(status.get('version'))
+        result = await asyncio.to_thread(faust_plugin.install, chosen, Path(clap_folder) if clap_folder else None,
+                                         force)
+    except (faust_plugin.InstallError, OSError) as error:
+        return output({'ok': False, 'changed': False, 'error': str(error)}, 'install_faust_plugin')
+    listed = None
+    if status:
+        try:
+            listed = (await read_query(FAUST_LISTED, 'Find the Faust plugin')).get('listed')
+        except Exception:
+            listed = None
+    if listed and result.get('changed'):
+        result['next'] = 'REAPER knew an earlier copy and may still have it loaded: the user restarts REAPER to use this one.'
+    elif listed:
+        result['next'] = 'REAPER lists the plugin; add_faust_fx works.'
+    else:
+        result['next'] = ('In REAPER the user clicks Options > Preferences > Plug-ins > CLAP > Re-scan (or restarts '
+                          'REAPER); then add_faust_fx works.')
+    return output(result, 'install_faust_plugin')
 
 
 def faust_program(body, **arguments):

@@ -145,3 +145,41 @@ jobs:
           chmod +x tools/clap_host_test* || true
           if [ "${{ matrix.rosetta }}" = true ]; then arch -x86_64 tools/clap_host_test "AutoReaper Faust/AutoReaper Faust.clap"
           else tools/clap_host_test* "AutoReaper Faust/AutoReaper Faust.clap"; fi
+
+  release:
+    # On a tag faust-plugin-v<version>, publish the tested zips as the release install_faust_plugin downloads;
+    # on other pushes, check the same files without publishing.
+    name: Release
+    needs: [package, clean-test]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: {pattern: "autoreaper-faust-*", path: dist, merge-multiple: true}
+      - name: Checksums and versions
+        run: |
+          plugin=$(sed -n 's/^project([^ ]* VERSION \([^ )]*\).*/\1/p' plugin/CMakeLists.txt)
+          server=$(sed -n "s/^VERSION = '\(.*\)'/\1/p" src/autoreaper/faust_plugin.py)
+          echo "plugin $plugin, server expects $server"
+          [ "$plugin" = "$server" ]
+          if [ "$GITHUB_REF_TYPE" = tag ]; then [ "$GITHUB_REF_NAME" = "faust-plugin-v$plugin" ]; fi
+          cd dist
+          ls -la
+          [ "$(ls autoreaper-faust-*.zip | wc -l)" = 4 ]
+          sha256sum autoreaper-faust-*.zip > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+          echo "PLUGIN_VERSION=$plugin" >> "$GITHUB_ENV"
+      - name: Publish
+        if: github.ref_type == 'tag' && startsWith(github.ref_name, 'faust-plugin-v')
+        run: |
+          cat > notes.md <<NOTES
+          The Faust (AutoReaper) CLAP plugin $PLUGIN_VERSION with Faust $FAUST_VERSION (libfaust and the Faust
+          libraries) included. AutoReaper's install_faust_plugin tool installs it; to install by hand, see
+          INSTALL.txt in the zip for your system.
+          NOTES
+          gh release create "$GITHUB_REF_NAME" dist/autoreaper-faust-*.zip dist/SHA256SUMS.txt \
+            --title "Faust plugin $PLUGIN_VERSION" --notes-file notes.md --verify-tag

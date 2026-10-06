@@ -25,7 +25,10 @@ another computer, and the code comes along. Undo restores earlier code.
 
 The package workflow (`.github/workflows/package.yml`) builds a zip per system that includes libfaust and the
 Faust libraries (Faust 2.88.0), so no Faust install is needed: `autoreaper-faust-windows-x64`,
-`-macos-arm64`, `-macos-x64` and `-linux-x64`. Each holds a folder `AutoReaper Faust` with `INSTALL.txt`:
+`-macos-arm64`, `-macos-x64` and `-linux-x64`. On a tag `faust-plugin-v<version>` it publishes them with
+`SHA256SUMS.txt` as a GitHub release; the MCP tool `install_faust_plugin` downloads the one for REAPER's system
+from the release matching its `VERSION` (`src/autoreaper/faust_plugin.py`, kept equal to this project's version)
+and installs it as below. Each zip holds a folder `AutoReaper Faust` with `INSTALL.txt`:
 
 | System | Copy | To |
 |---|---|---|
