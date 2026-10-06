@@ -59,6 +59,14 @@ local PROTOCOL = 3
 -- This file, so install_bridge can ask the running bridge to reload it in place
 -- (running the action again would make REAPER ask about a second instance).
 local script_path = debug.getinfo(1, 'S').source:match('^@(.+)$')
+-- Faust effects (install_bridge copies the module beside this script): code
+-- saved in REAPER's JSFX editor is compiled without the server.
+local faust = script_path and (function()
+  local ok, module = pcall(dofile, script_path:gsub('[^/\\]*$', '') .. 'AutoReaper Faust.lua')
+  return ok and type(module) == 'table' and module or nil
+end)()
+local faust_state = {mailbox = root, build_dir = root .. sep .. 'faust-build'}
+local last_faust_watch = 0
 -- Id of the claimed request, so an unexpected error still leaves a receipt
 -- instead of the caller waiting out its whole timeout.
 local current = nil
@@ -77,8 +85,12 @@ local function owns_mailbox()
 end
 local function step()
   if reaper.time_precise()-last_heartbeat > .5 then
-    write('heartbeat.json', {session=session, timestamp=os.time(), project_id=project_id(), version=reaper.GetAppVersion(), protocol=PROTOCOL})
+    write('heartbeat.json', {session=session, timestamp=os.time(), project_id=project_id(), version=reaper.GetAppVersion(), protocol=PROTOCOL, faust=faust~=nil})
     last_heartbeat=reaper.time_precise()
+  end
+  if faust and reaper.time_precise()-last_faust_watch > 1 then
+    last_faust_watch=reaper.time_precise()
+    faust.watch(faust_state)
   end
   local f=io.open(path('request.lua'),'rb')
   if f then
@@ -163,7 +175,7 @@ local function step()
             end
           end
         end
-        pcall(write,'heartbeat.json',{session=session,timestamp=os.time(),project_id=project_id(),version=reaper.GetAppVersion(),protocol=PROTOCOL})
+        pcall(write,'heartbeat.json',{session=session,timestamp=os.time(),project_id=project_id(),version=reaper.GetAppVersion(),protocol=PROTOCOL,faust=faust~=nil})
         if not pcall(write,req.id..'.json',result) then
           -- The request itself ran to completion; only its return value was
           -- not JSON. Report the real outcome without that payload so a
@@ -199,6 +211,7 @@ local function reload_requested()
   f:close(); os.remove(path('reload.request'))
   return script_path~=nil
 end
+faust_state.report=function(message) pcall(report, message) end
 local function loop()
   if not owns_mailbox() then return end
   if reload_requested() then

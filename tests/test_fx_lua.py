@@ -176,6 +176,8 @@ def test_server_programs_compile():
     for body in (server.ADD_FX, server.FX_PARAMETERS, server.SET_FX_PARAMETERS, server.EDIT_FX, server.SIDECHAIN_SEND,
                  server.RESOLVE_TRACKS):
         assert compile_(server.fx_program(body, track='Bass', fx=0)) is None
+    for body in (server.FAUST_FX, server.FAUST_SOURCE):
+        assert compile_(server.faust_program(body, name='Lead Ducker')) is None
 
 
 def test_set_does_not_probe_live_when_formatting_is_reliable(lua):

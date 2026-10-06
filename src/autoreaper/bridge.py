@@ -19,6 +19,8 @@ from filelock import FileLock
 
 LUA = Path(__file__).with_name('lua')
 BRIDGE_SCRIPT_NAME = 'AutoReaper Bridge.lua'
+# Loaded by the bridge from the same folder, to compile Faust effects on save.
+FAUST_SCRIPT_NAME = 'AutoReaper Faust.lua'
 # The bridge protocol this server speaks; the heartbeat reports the script's.
 PROTOCOL = 3
 STALE_SECONDS = 5
@@ -51,6 +53,7 @@ def install_bridge_script(resource_path: Path | None = None) -> Path:
             'in explorer/finder and pass that folder.')
     destination = resource / 'Scripts' / BRIDGE_SCRIPT_NAME
     destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(LUA / 'faust.lua', destination.with_name(FAUST_SCRIPT_NAME))
     shutil.copyfile(LUA / 'bridge.lua', destination)
     return destination
 
