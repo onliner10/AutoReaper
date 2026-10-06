@@ -7,6 +7,11 @@ name: Package the Faust plugin
 on:
   push:
   workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish the release faust-plugin-v<plugin version> from the default branch
+        type: boolean
+        default: false
 
 env:
   FAUST_VERSION: 2.88.0
@@ -147,8 +152,8 @@ jobs:
           else tools/clap_host_test* "AutoReaper Faust/AutoReaper Faust.clap"; fi
 
   release:
-    # On a tag faust-plugin-v<version>, publish the tested zips as the release install_faust_plugin downloads;
-    # on other pushes, check the same files without publishing.
+    # On a tag faust-plugin-v<version>, or from the Actions tab (Run workflow, publish), publish the tested zips
+    # as the release install_faust_plugin downloads; on other pushes, check the same files without publishing.
     name: Release
     needs: [package, clean-test]
     runs-on: ubuntu-24.04
@@ -174,12 +179,25 @@ jobs:
           cat SHA256SUMS.txt
           echo "PLUGIN_VERSION=$plugin" >> "$GITHUB_ENV"
       - name: Publish
-        if: github.ref_type == 'tag' && startsWith(github.ref_name, 'faust-plugin-v')
+        if: >-
+          (github.ref_type == 'tag' && startsWith(github.ref_name, 'faust-plugin-v')) ||
+          (github.event_name == 'workflow_dispatch' && inputs.publish)
         run: |
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            tag="$GITHUB_REF_NAME"; from=(--verify-tag)
+          else
+            # The Actions button: GitHub makes the tag on this commit.
+            [ "$GITHUB_REF_NAME" = "${{ github.event.repository.default_branch }}" ] ||
+              { echo "Publish from ${{ github.event.repository.default_branch }}, not $GITHUB_REF_NAME"; exit 1; }
+            tag="faust-plugin-v$PLUGIN_VERSION"; from=(--target "$GITHUB_SHA")
+          fi
+          if gh release view "$tag" > /dev/null 2>&1; then
+            echo "Release $tag exists already; raise the version in plugin/CMakeLists.txt and faust_plugin.py"; exit 1
+          fi
           cat > notes.md <<NOTES
           The Faust (AutoReaper) CLAP plugin $PLUGIN_VERSION with Faust $FAUST_VERSION (libfaust and the Faust
           libraries) included. AutoReaper's install_faust_plugin tool installs it; to install by hand, see
           INSTALL.txt in the zip for your system.
           NOTES
-          gh release create "$GITHUB_REF_NAME" dist/autoreaper-faust-*.zip dist/SHA256SUMS.txt \
-            --title "Faust plugin $PLUGIN_VERSION" --notes-file notes.md --verify-tag
+          gh release create "$tag" dist/autoreaper-faust-*.zip dist/SHA256SUMS.txt \
+            --title "Faust plugin $PLUGIN_VERSION" --notes-file notes.md "${from[@]}"
