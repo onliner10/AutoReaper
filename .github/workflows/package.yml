@@ -38,6 +38,9 @@ jobs:
           root="$PWD/faust-root"
           mkdir -p "$root/lib" "$root/include" "$root/share"
           cp -a libfaust/lib/libfaust.so* "$root/lib/"
+          # The release ships libfaust.so; programs ask for its SONAME (libfaust.so.2).
+          soname=$(readelf -d "$root/lib/libfaust.so" | sed -n 's/.*Library soname: \[\(.*\)\]/\1/p')
+          [ -n "$soname" ] && [ ! -e "$root/lib/$soname" ] && ln -s libfaust.so "$root/lib/$soname"
           cp -a "faust-$FAUST_VERSION/architecture/faust" "$root/include/faust"
           mkdir -p "$root/share/faust" && cp "faust-$FAUST_VERSION"/libraries/*.lib "$root/share/faust/"
           cp "faust-$FAUST_VERSION/COPYING.txt" "$root/" 2>/dev/null || true
