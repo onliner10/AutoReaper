@@ -1,4 +1,4 @@
-name: Explore Faust releases (temporary)
+name: Explore Faust releases (temporary, removed after use)
 
 on:
   push:
