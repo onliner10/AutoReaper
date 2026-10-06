@@ -53,7 +53,7 @@ int main() {
     for (int at = 0; at < frames; at += 512) {  // host-sized blocks
         const float* in[4] = {inputs[0] + at, inputs[1] + at, inputs[2] + at, inputs[3] + at};
         float* out[2] = {outputs[0] + at, outputs[1] + at};
-        process(*result.program, in, 4, out, 512 < frames - at ? 512 : frames - at);
+        run(*result.program, in, 4, out, 512 < frames - at ? 512 : frames - at, Transport{}, nullptr, 0);
     }
     const float before = rms(ol, 4800, 24000), after = rms(ol, 33600, 48000);
     const float drop = 20 * std::log10(after / before);
@@ -62,8 +62,59 @@ int main() {
 
     // Missing sidechain input: reads silence, no ducking.
     reset(*result.program);
-    process(*result.program, inputs, 2, outputs, 4800);
+    run(*result.program, inputs, 2, outputs, 4800, Transport{}, nullptr, 0);
     CHECK(rms(ol, 2400, 4800) > 0.3f);
+
+    // MIDI: a note 36 halfway through a block mutes from exactly that frame.
+    auto gate = compile("process(l, r, kl, kr) = l * (1 - t), r * (1 - t) with { t = button(\"kick [midi:key 36]\") > 0; };",
+                        48000, libraries);
+    CHECK(gate.program != nullptr);
+    if (gate.program) {
+        std::vector<float> ones(512, 1.f), a(512), b(512);
+        const float* in[4] = {ones.data(), ones.data(), nullptr, nullptr};
+        float* out[2] = {a.data(), b.data()};
+        const MidiMessage note_on[] = {{300, 0x90, 36, 100}, {301, 0x90, 40, 100}};
+        run(*gate.program, in, 4, out, 512, Transport{}, note_on, 2);
+        CHECK(a[299] == 1.f && a[300] == 0.f && a[511] == 0.f);
+        const MidiMessage note_off[] = {{100, 0x80, 36, 0}};
+        run(*gate.program, in, 4, out, 512, Transport{}, note_off, 1);
+        CHECK(a[99] == 0.f && a[100] == 1.f);
+        const MidiMessage other[] = {{0, 0x90, 37, 100}};
+        run(*gate.program, in, 4, out, 512, Transport{}, other, 1);
+        CHECK(a[511] == 1.f);  // other notes do nothing
+    }
+
+    // Host sync: an impulse on the frame where each quarter note starts.
+    auto pulse = compile(
+        "beat = nentry(\"beat [host:beat]\", 0, 0, 1e9, 0.0001);\n"
+        "playing = nentry(\"playing [host:playing]\", 0, 0, 1, 1);\n"
+        "process(l, r, kl, kr) = t, t with { q = floor(beat); t = (q != q') * playing; };",
+        48000, libraries);
+    CHECK(pulse.program != nullptr && pulse.messages.empty());
+    if (pulse.program) {
+        Transport transport;
+        transport.playing = true;
+        transport.bpm = 120;   // 24000 frames per quarter note at 48 kHz
+        transport.beat = 0.5;  // start halfway into the first beat
+        std::vector<int> pulses;
+        std::vector<float> a(512), b(512);
+        float* out[2] = {a.data(), b.data()};
+        const float* in[4] = {nullptr, nullptr, nullptr, nullptr};
+        for (int block = 0; block < 300; ++block) {
+            run(*pulse.program, in, 4, out, 512, transport, nullptr, 0);
+            for (int i = 0; i < 512; ++i)
+                if (a[i] > 0.5f) pulses.push_back(block * 512 + i);
+            transport.beat += 512 / 24000.0;
+        }
+        std::printf("quarter-note pulses at frames:");
+        for (int frame : pulses) std::printf(" %d", frame);
+        std::printf("\n");
+        // Beats 1..6 start at 12000 + k * 24000 frames.
+        CHECK(pulses.size() == 6);
+        for (size_t k = 0; k < pulses.size(); ++k) CHECK(pulses[k] == int(12000 + k * 24000));
+    }
+    auto typo = compile("process = nentry(\"t [host:tempo]\", 0, 0, 1, 1);", 48000, libraries);
+    CHECK(typo.program && typo.messages.find("unknown [host:tempo]") != std::string::npos);
 
     auto broken = compile("process = _ : nosuchfunction;", 48000, libraries);
     CHECK(broken.program == nullptr);

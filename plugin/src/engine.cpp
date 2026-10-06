@@ -1,18 +1,62 @@
 #include "engine.h"
 
 #include <faust/dsp/llvm-dsp.h>
+#include <faust/gui/MidiUI.h>
+#include <faust/gui/UI.h>
+#include <faust/midi/midi.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <sstream>
 #include <sys/stat.h>
+
+// Faust's GUI keeps a list of every GUI (MidiUI is one); defined once here.
+std::list<GUI*> GUI::fGuiList;
+ztimedmap GUI::gTimedZoneMap;
 
 namespace autoreaper {
 
 namespace {
 
 constexpr int kCapacity = 1024;
+constexpr int kGrid = 48;         // host controls change on this fraction of a quarter note
+constexpr int kHostStep = 32;     // and at least this often (frames)
+
+// Collects the controls marked [host:...]; unknown names become messages.
+struct HostZonesUI : public UI {
+    HostZones& zones;
+    std::string& messages;
+    HostZonesUI(HostZones& z, std::string& m) : zones(z), messages(m) {}
+    void declare(FAUSTFLOAT* zone, const char* key, const char* value) override {
+        if (!zone || std::strcmp(key, "host")) return;
+        const std::string name = value;
+        if (name == "bpm") zones.bpm.push_back(zone);
+        else if (name == "beat") zones.beat.push_back(zone);
+        else if (name == "bar") zones.bar.push_back(zone);
+        else if (name == "playing") zones.playing.push_back(zone);
+        else if (name == "num") zones.num.push_back(zone);
+        else if (name == "den") zones.den.push_back(zone);
+        else messages += "AutoReaper: unknown [host:" + name + "]; use bpm, beat, bar, playing, num or den.\n";
+    }
+    void openTabBox(const char*) override {}
+    void openHorizontalBox(const char*) override {}
+    void openVerticalBox(const char*) override {}
+    void closeBox() override {}
+    void addButton(const char*, FAUSTFLOAT*) override {}
+    void addCheckButton(const char*, FAUSTFLOAT*) override {}
+    void addVerticalSlider(const char*, FAUSTFLOAT*, FAUSTFLOAT, FAUSTFLOAT, FAUSTFLOAT, FAUSTFLOAT) override {}
+    void addHorizontalSlider(const char*, FAUSTFLOAT*, FAUSTFLOAT, FAUSTFLOAT, FAUSTFLOAT, FAUSTFLOAT) override {}
+    void addNumEntry(const char*, FAUSTFLOAT*, FAUSTFLOAT, FAUSTFLOAT, FAUSTFLOAT, FAUSTFLOAT) override {}
+    void addHorizontalBargraph(const char*, FAUSTFLOAT*, FAUSTFLOAT, FAUSTFLOAT) override {}
+    void addVerticalBargraph(const char*, FAUSTFLOAT*, FAUSTFLOAT, FAUSTFLOAT) override {}
+    void addSoundfile(const char*, const char*, Soundfile**) override {}
+};
+
+void set_all(const std::vector<float*>& zones, double value) {
+    for (float* zone : zones) *zone = float(value);
+}
 
 bool is_dir(const std::string& path) {
     struct stat info;
@@ -22,6 +66,8 @@ bool is_dir(const std::string& path) {
 }  // namespace
 
 Program::~Program() {
+    midi_ui.reset();  // its zones live in the instance
+    midi.reset();
     delete instance;  // before its factory
     if (factory) deleteDSPFactory(factory);
 }
@@ -60,6 +106,13 @@ CompileResult compile(const std::string& code, double sample_rate, const std::ve
         return result;
     }
     program->instance->init(int(sample_rate));
+    program->sample_rate = sample_rate;
+    program->midi = std::make_unique<midi_handler>();
+    program->midi_ui = std::make_unique<MidiUI>(program->midi.get());
+    program->instance->buildUserInterface(program->midi_ui.get());
+    std::string host_messages;
+    HostZonesUI host(program->host, host_messages);
+    program->instance->buildUserInterface(&host);
     program->inputs = program->instance->getNumInputs();
     program->outputs = program->instance->getNumOutputs();
     program->capacity = kCapacity;
@@ -67,7 +120,7 @@ CompileResult compile(const std::string& code, double sample_rate, const std::ve
     program->input_pointers.resize(program->inputs);
     program->output_pointers.resize(program->outputs);
     for (int i = 0; i < program->outputs; ++i) program->output_pointers[i] = program->scratch[program->inputs + i].data();
-    result.messages = error;  // warnings, if any
+    result.messages = error + host_messages;  // warnings, if any
     result.program = std::move(program);
     return result;
 }
@@ -87,6 +140,49 @@ void process(Program& program, const float* const* inputs, int input_count, floa
             if (program.outputs == 0) std::memset(out, 0, sizeof(float) * count);
             else std::memcpy(out, program.output_pointers[std::min(side, program.outputs - 1)], sizeof(float) * count);
         }
+    }
+}
+
+void run(Program& program, const float* const* inputs, int input_count, float* const* outputs, int frames,
+         const Transport& transport, const MidiMessage* midi, int midi_count) {
+    const bool host = !program.host.empty();
+    const double frames_per_beat = program.sample_rate * 60.0 / std::max(1.0, transport.bpm);
+    const double bar_length = 4.0 * std::max(1, transport.num) / std::max(1, transport.den);
+    int at = 0, next_midi = 0;
+    while (at < frames) {
+        for (; next_midi < midi_count && midi[next_midi].frame <= at; ++next_midi) {
+            const MidiMessage& m = midi[next_midi];
+            if ((m.status & 0xF0) == 0xC0 || (m.status & 0xF0) == 0xD0)
+                program.midi->handleData1(0, m.status & 0xF0, m.status & 0x0F, m.data1);
+            else
+                program.midi->handleData2(0, m.status & 0xF0, m.status & 0x0F, m.data1, m.data2);
+        }
+        int end = frames;
+        if (next_midi < midi_count) end = std::min(end, midi[next_midi].frame);
+        if (host) {
+            double beat = transport.beat + (transport.playing ? at / frames_per_beat : 0.0);
+            const double grid = std::round(beat * kGrid);
+            if (std::fabs(beat * kGrid - grid) < 1e-6) beat = grid / kGrid;  // exactly on the grid
+            double bar = transport.bar;
+            if (transport.playing && beat >= bar + bar_length) bar += std::floor((beat - bar) / bar_length) * bar_length;
+            set_all(program.host.beat, beat);
+            set_all(program.host.bar, bar);
+            set_all(program.host.bpm, transport.bpm);
+            set_all(program.host.playing, transport.playing ? 1 : 0);
+            set_all(program.host.num, transport.num);
+            set_all(program.host.den, transport.den);
+            end = std::min(end, at + kHostStep);
+            if (transport.playing) {
+                const double next_line = (std::floor(beat * kGrid + 1e-6) + 1) / kGrid;
+                end = std::min(end, int(std::ceil((next_line - transport.beat) * frames_per_beat - 1e-6)));
+            }
+        }
+        end = std::max(end, at + 1);
+        const float* in[4] = {nullptr, nullptr, nullptr, nullptr};
+        for (int i = 0; i < input_count && i < 4; ++i) in[i] = inputs[i] ? inputs[i] + at : nullptr;
+        float* out[2] = {outputs[0] + at, outputs[1] + at};
+        process(program, in, input_count, out, end - at);
+        at = end;
     }
 }
 

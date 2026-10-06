@@ -11,6 +11,13 @@ another computer, and the code comes along. Undo restores earlier code.
   effect keeps running its last compiled code.
 - **Audio**: inputs are main L, R and sidechain L, R (the pins "Sidechain 1/2"); outputs are L, R. A Faust
   program with one output feeds both.
+- **MIDI** (a note input port): Faust's MIDI metadata drives controls, e.g. `button("kick [midi:key 36]")` is 1
+  while note 36 is held; also `keyon`, `keyoff`, `ctrl`, `pitchwheel`, `chanpress`, `pgm`, with an optional
+  channel (`[midi:key 36 10]`). The block is split at each message, so a control changes on its exact frame.
+- **Host sync**: controls marked `[host:beat]` (quarter notes from the project start), `[host:bpm]`,
+  `[host:playing]`, `[host:bar]` (quarter notes to the current bar), `[host:num]`, `[host:den]` follow the
+  transport. While playing, the block is split on every 1/48 of a quarter note (and at least every 32 frames),
+  so `floor(beat)` changes on the frame where the beat starts. Unknown names are reported as warnings.
 - **Unfinished edits**: code changed in the window and not compiled yet is kept in the state too (as a draft),
   so saving the project keeps it, and AutoReaper's `edit_faust_fx` refuses to overwrite it.
 
@@ -23,7 +30,7 @@ the CLAP SDK, Dear ImGui and ImGuiColorTextEdit.
 # Debian/Ubuntu: apt install faust libx11-dev cmake g++
 cmake -S plugin -B plugin/build -DCMAKE_BUILD_TYPE=Release
 cmake --build plugin/build -j
-plugin/build/engine_test                 # compiles and runs a ducker, checks the state format
+plugin/build/engine_test                 # ducking, MIDI and beat timing to the frame, the state format
 plugin/build/ui_snapshot window.ppm      # draws the window without a host
 mkdir -p ~/.clap && cp "plugin/build/AutoReaper Faust.clap" ~/.clap/
 ```

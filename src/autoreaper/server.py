@@ -754,8 +754,12 @@ async def add_faust_fx(
     plugin running this code: the project stores the code like any plugin setting, and the plugin window is a code
     editor where the user can change it and compile. Faust inputs are main L, R, then sidechain L, R (the plugin's
     Sidechain pins; route a key with sidechain_send kind audio, channels 3, fx <this effect>); outputs are L, R
-    (one output feeds both). Write settings as constants in the code. If the code does not compile nothing is added
-    and Faust's messages are returned. One Undo step. Bypass, move or remove it with edit_fx like any plugin."""
+    (one output feeds both). MIDI reaches controls marked [midi:key 36], [midi:keyon 36], [midi:ctrl 1] (add a
+    channel: [midi:key 36 10]) on the frame it arrives (sidechain_send kind midi). Controls marked [host:beat]
+    (quarter notes), [host:bpm], [host:playing], [host:bar], [host:num], [host:den] follow REAPER's transport, so
+    floor(beat) changes on the frame where each quarter note starts. Write settings as constants in the code. If
+    the code does not compile nothing is added and Faust's messages are returned. One Undo step. Bypass, move or
+    remove it with edit_fx like any plugin."""
     try:
         result = await fx_write(ADD_FAUST_FX, f'Add Faust FX {name}', program=faust_program, track=track, name=name,
                                 code=code, position=position, bypassed=bypassed)

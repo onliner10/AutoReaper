@@ -97,6 +97,31 @@ track, a gain or filter utility, a gate, a custom envelope. Prefer the standard 
   ```
 
   Then `sidechain_send` from the key track, `kind: "audio"`, `channels: 3`, `fx: <the effect>`.
+- **MIDI sidechain**: a control marked `[midi:key 36]` is 1 while note 36 is held (velocity / 127), on the exact
+  frame; `[midi:keyon 36]` keeps the last velocity, `[midi:ctrl 1]` follows a CC; add a channel
+  (`[midi:key 36 10]`) to react to one channel only. Route the notes with `sidechain_send` `kind: "midi"`.
+
+  ```faust
+  kick = button("kick [midi:key 36]") > 0;
+  process(l, r, kl, kr) = l * g, r * g with { g = ba.db2linear(-12 * kick) : si.smoo; };
+  ```
+
+  An instrument earlier on the same track receives those notes too and plays them (measured with ReaSynth). Put
+  the Faust effect on a bus the instrument's track feeds and send the MIDI there instead, or use MIDI bus 2 and
+  ask the user to set the Faust plugin's MIDI input bus (pin connector).
+- **Host sync**: controls marked `[host:beat]` (position in quarter notes), `[host:bpm]`, `[host:playing]` (1/0),
+  `[host:bar]` (where the current bar starts, in quarter notes), `[host:num]`, `[host:den]` follow the transport.
+  They change exactly on every 1/48 of a quarter note (and at least every 32 frames), so a step pattern is
+  sample-accurate:
+
+  ```faust
+  beat = nentry("beat [host:beat]", 0, 0, 1e9, 0.0001);
+  playing = nentry("playing [host:playing]", 0, 0, 1, 1);
+  first16 = (beat - floor(beat)) < 0.25;                 // first sixteenth of each quarter note
+  quarter = floor(beat); onbeat = (quarter != quarter') * playing;   // a one-frame impulse per quarter note
+  ```
+
+  Host sync follows the grid even where the drums pause; a sidechain follows the actual hits. Say which you chose.
 - Write settings as named constants with a comment, so the user can read and change them in the window.
 - If the code does not compile, nothing is added (or the edit is not applied) and `messages` has Faust's errors
   (`faust : <line> : ERROR : ...`, lines counted from the first line of your code). Fix and retry.

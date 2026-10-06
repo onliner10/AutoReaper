@@ -10,6 +10,8 @@
 
 #include <clap/clap.h>
 
+#include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -24,7 +26,11 @@
 namespace autoreaper {
 namespace {
 
-const char* kDefaultCode = "import(\"stdfaust.lib\");\n\n// The effect: inputs are main L, R, sidechain L, R.\nprocess = _, _;\n";
+const char* kDefaultCode =
+    "import(\"stdfaust.lib\");\n\n"
+    "// Inputs: main L, R, sidechain L, R. MIDI: controls with [midi:key 36], [midi:ctrl 1], ...\n"
+    "// Host: controls with [host:beat] (quarter notes), [host:bpm], [host:playing], [host:bar].\n"
+    "process = _, _;\n";
 constexpr int kDefaultWidth = 760, kDefaultHeight = 480;
 
 std::string plugin_dir() {
@@ -73,6 +79,7 @@ struct Plugin {
     Program* current = nullptr;
     std::atomic<Program*> next{nullptr};
     std::atomic<Program*> retired{nullptr};
+    std::array<MidiMessage, 1024> midi;  // one block's MIDI, for the audio thread
 
     // Compile on the main thread. On success the text becomes the running
     // code; on error the running program and code stay, with Faust's messages.
@@ -133,6 +140,23 @@ bool ports_get(const clap_plugin_t*, uint32_t index, bool is_input, clap_audio_p
 }
 
 const clap_plugin_audio_ports_t kAudioPorts = {ports_count, ports_get};
+
+// ------------------------------------------------------------------ note ports
+
+// One MIDI input, for [midi:...] controls (triggers, CCs): a MIDI sidechain.
+uint32_t note_ports_count(const clap_plugin_t*, bool is_input) { return is_input ? 1 : 0; }
+
+bool note_ports_get(const clap_plugin_t*, uint32_t index, bool is_input, clap_note_port_info_t* info) {
+    if (!is_input || index != 0) return false;
+    std::memset(info, 0, sizeof(*info));
+    info->id = 0;
+    info->supported_dialects = CLAP_NOTE_DIALECT_CLAP | CLAP_NOTE_DIALECT_MIDI;
+    info->preferred_dialect = CLAP_NOTE_DIALECT_MIDI;
+    std::snprintf(info->name, sizeof(info->name), "MIDI in");
+    return true;
+}
+
+const clap_plugin_note_ports_t kNotePorts = {note_ports_count, note_ports_get};
 
 // ------------------------------------------------------------------ state
 
@@ -359,8 +383,52 @@ clap_process_status plugin_process(const clap_plugin_t* plugin, const clap_proce
     if (process->audio_outputs_count < 1 || process->audio_outputs[0].channel_count < 2) return CLAP_PROCESS_CONTINUE;
     float* const* outputs = process->audio_outputs[0].data32;
     const int frames = int(process->frames_count);
+
+    // Notes and MIDI messages, in time order as CLAP delivers them.
+    int midi_count = 0;
+    const uint32_t event_count = process->in_events->size(process->in_events);
+    for (uint32_t i = 0; i < event_count && midi_count < int(p->midi.size()); ++i) {
+        const clap_event_header_t* header = process->in_events->get(process->in_events, i);
+        if (header->space_id != CLAP_CORE_EVENT_SPACE_ID) continue;
+        MidiMessage& m = p->midi[midi_count];
+        m.frame = int(header->time);
+        if (header->type == CLAP_EVENT_NOTE_ON || header->type == CLAP_EVENT_NOTE_OFF) {
+            const auto* note = reinterpret_cast<const clap_event_note_t*>(header);
+            if (note->key < 0 || note->key > 127) continue;
+            const int channel = note->channel < 0 ? 0 : note->channel & 15;
+            const int velocity = int(note->velocity * 127 + 0.5);
+            const bool on = header->type == CLAP_EVENT_NOTE_ON;
+            m.status = (unsigned char)((on ? 0x90 : 0x80) | channel);
+            m.data1 = (unsigned char)note->key;
+            m.data2 = (unsigned char)(on ? std::max(1, std::min(127, velocity)) : velocity);
+        } else if (header->type == CLAP_EVENT_MIDI) {
+            const auto* midi = reinterpret_cast<const clap_event_midi_t*>(header);
+            if (midi->data[0] < 0x80 || midi->data[0] >= 0xF0) continue;
+            m.status = midi->data[0];
+            m.data1 = midi->data[1];
+            m.data2 = midi->data[2];
+        } else {
+            continue;
+        }
+        ++midi_count;
+    }
+
+    Transport transport;
+    if (const clap_event_transport_t* t = process->transport) {
+        transport.playing = t->flags & CLAP_TRANSPORT_IS_PLAYING;
+        if (t->flags & CLAP_TRANSPORT_HAS_TEMPO) transport.bpm = t->tempo;
+        if (t->flags & CLAP_TRANSPORT_HAS_BEATS_TIMELINE) {
+            transport.beat = double(t->song_pos_beats) / CLAP_BEATTIME_FACTOR;
+            transport.bar = double(t->bar_start) / CLAP_BEATTIME_FACTOR;
+        }
+        if (t->flags & CLAP_TRANSPORT_HAS_TIME_SIGNATURE) {
+            transport.num = t->tsig_num;
+            transport.den = t->tsig_denom;
+        }
+    }
+
     if (p->current) {
-        autoreaper::process(*p->current, inputs, input_count, outputs, frames);
+        run(*p->current, inputs, input_count, outputs, frames, transport, p->midi.data(), midi_count);
     } else {
         for (int side = 0; side < 2; ++side) {
             if (inputs[side] && inputs[side] != outputs[side]) std::memcpy(outputs[side], inputs[side], sizeof(float) * frames);
@@ -373,6 +441,7 @@ clap_process_status plugin_process(const clap_plugin_t* plugin, const clap_proce
 const void* plugin_get_extension(const clap_plugin_t*, const char* id) {
     if (!std::strcmp(id, CLAP_EXT_AUDIO_PORTS)) return &kAudioPorts;
     if (!std::strcmp(id, CLAP_EXT_STATE)) return &kState;
+    if (!std::strcmp(id, CLAP_EXT_NOTE_PORTS)) return &kNotePorts;
 #ifdef __linux__
     if (!std::strcmp(id, CLAP_EXT_GUI)) return &kGui;
     if (!std::strcmp(id, CLAP_EXT_TIMER_SUPPORT)) return &kTimer;
