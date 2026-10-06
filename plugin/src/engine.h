@@ -46,8 +46,9 @@ struct CompileResult {
     std::string messages;              // Faust's errors (or warnings)
 };
 
-// Faust library folders: AUTOREAPER_FAUST_LIBRARIES, the folder beside the
-// plugin, then the usual install locations.
+// Faust library folders: AUTOREAPER_FAUST_LIBRARIES, faustlibraries beside
+// the plugin (or in its macOS bundle's Resources), then the usual install
+// locations.
 std::vector<std::string> library_paths(const std::string& plugin_dir);
 
 CompileResult compile(const std::string& code, double sample_rate, const std::vector<std::string>& libraries);

@@ -236,3 +236,29 @@ def test_faust_state_round_trip_matches_the_plugin_format():
     assert faust.hash(code) == faust.hash(code) != faust.hash(code + ' ')
     for size in range(5):  # base64 padding
         assert faust.decode(faust.encode('abcd'[:size])) == 'abcd'[:size]
+
+
+@pytest.mark.parametrize('newline', ['\n', '\r\n'])
+def test_faust_state_in_a_track_chunk(newline):
+    """faust.read/write find the plugin's <STATE> by FX GUID, with Unix or Windows line ends."""
+    runtime = lua_module.LuaRuntime(unpack_returned_tuples=True)
+    faust = runtime.execute((LUA / 'faust.lua').read_text(encoding='utf-8'))
+    code = 'process = _ * 0.5;\n'
+    encoded = faust.encode(faust.serialize(code))
+    lines = ['<TRACK', 'NAME LEAD', '<FXCHAIN', 'BYPASS 0 0 0', '<VST "VSTi: Other" other.so', 'AAAA', '>',
+             'FXID {11111111-0000-0000-0000-000000000000}',
+             '<CLAP "CLAP: Faust (AutoReaper)" com.autoreaper.faust ""', 'CFG 4 0 0 ""', '<STATE',
+             encoded[:40], encoded[40:], '>', '>', 'FXID {22222222-0000-0000-0000-000000000000}', '>', '>']
+    runtime.globals().chunk = newline.join(lines) + newline
+    runtime.execute('''
+      reaper = {
+        GetTrackStateChunk = function() return true, chunk end,
+        SetTrackStateChunk = function(_, c) chunk = c; return true end,
+        TrackFX_GetFXGUID = function() return '{22222222-0000-0000-0000-000000000000}' end,
+        TrackFX_GetNamedConfigParm = function() return true, '/x/AutoReaper Faust.clap<com.autoreaper.faust' end,
+      }''')
+    state = faust.read(None, 1)
+    assert state.code == code and state.status == 'none'
+    after = faust.write(None, 1, faust.serialize('process = _;\n'))
+    assert after.code == 'process = _;\n'
+    assert 'NAME LEAD' in runtime.globals().chunk and 'AAAA' in runtime.globals().chunk  # the rest untouched

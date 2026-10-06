@@ -1,4 +1,6 @@
-#include "x11_window.h"
+#include "window.h"
+
+#include <clap/ext/gui.h>
 
 #include <X11/Xatom.h>
 #include <X11/Xlib.h>
@@ -6,12 +8,14 @@
 #include <X11/keysym.h>
 
 #include <chrono>
+#include <cstdint>
 #include <cstring>
 #include <thread>
 
 namespace autoreaper {
 
-struct X11Window::Impl {
+struct PlatformWindow::Impl {
+    Ui* ui = nullptr;
     Display* display = nullptr;
     Window window = 0;
     GC gc = nullptr;
@@ -28,9 +32,13 @@ struct X11Window::Impl {
     }
 };
 
-X11Window::X11Window() : impl_(new Impl) {}
+const char* PlatformWindow::api() { return CLAP_WINDOW_API_X11; }
 
-X11Window::~X11Window() {
+PlatformWindow::PlatformWindow() : impl_(new Impl) {}
+
+void PlatformWindow::set_ui(Ui* ui) { impl_->ui = ui; }
+
+PlatformWindow::~PlatformWindow() {
     if (impl_->display) {
         impl_->drop_image();
         if (impl_->gc) XFreeGC(impl_->display, impl_->gc);
@@ -40,7 +48,8 @@ X11Window::~X11Window() {
     delete impl_;
 }
 
-bool X11Window::attach(unsigned long parent, int width, int height) {
+bool PlatformWindow::attach(void* parent_window, int width, int height) {
+    const Window parent = Window(reinterpret_cast<uintptr_t>(parent_window));
     Impl& x = *impl_;
     if (!x.display) x.display = XOpenDisplay(nullptr);
     if (!x.display) return false;
@@ -60,13 +69,13 @@ bool X11Window::attach(unsigned long parent, int width, int height) {
     return true;
 }
 
-void X11Window::resize(int width, int height) {
+void PlatformWindow::resize(int width, int height) {
     impl_->width = width;
     impl_->height = height;
     if (impl_->display && impl_->window) XResizeWindow(impl_->display, impl_->window, width, height);
 }
 
-void X11Window::show(bool visible) {
+void PlatformWindow::show(bool visible) {
     if (!impl_->display || !impl_->window) return;
     if (visible) XMapWindow(impl_->display, impl_->window);
     else XUnmapWindow(impl_->display, impl_->window);
@@ -99,9 +108,34 @@ static Key editor_key(KeySym symbol) {
     }
 }
 
-void X11Window::pump(Ui& ui) {
+// Another program pastes our CLIPBOARD text.
+static void serve_selection(PlatformWindow::Impl& x, const XSelectionRequestEvent& request) {
+    XEvent reply{};
+    reply.xselection.type = SelectionNotify;
+    reply.xselection.requestor = request.requestor;
+    reply.xselection.selection = request.selection;
+    reply.xselection.target = request.target;
+    reply.xselection.time = request.time;
+    reply.xselection.property = None;
+    const Atom property = request.property != None ? request.property : request.target;
+    if (request.target == x.targets) {
+        const Atom offered[] = {x.targets, x.utf8, XA_STRING};
+        XChangeProperty(x.display, request.requestor, property, XA_ATOM, 32, PropModeReplace,
+                        reinterpret_cast<const unsigned char*>(offered), 3);
+        reply.xselection.property = property;
+    } else if (request.target == x.utf8 || request.target == XA_STRING) {
+        XChangeProperty(x.display, request.requestor, property, request.target, 8, PropModeReplace,
+                        reinterpret_cast<const unsigned char*>(x.owned.data()), int(x.owned.size()));
+        reply.xselection.property = property;
+    }
+    XSendEvent(x.display, request.requestor, False, 0, &reply);
+    XFlush(x.display);
+}
+
+void PlatformWindow::pump() {
     Impl& x = *impl_;
-    if (!x.display) return;
+    if (!x.display || !x.ui) return;
+    Ui& ui = *x.ui;
     while (XPending(x.display)) {
         XEvent event;
         XNextEvent(x.display, &event);
@@ -144,14 +178,14 @@ void X11Window::pump(Ui& ui) {
             }
             case FocusIn: ui.focus(true); break;
             case FocusOut: ui.focus(false); break;
-            case SelectionRequest: serve_selection(&event); break;
+            case SelectionRequest: serve_selection(x, event.xselectionrequest); break;
             case SelectionClear: x.owned.clear(); break;
             default: break;
         }
     }
 }
 
-void X11Window::present(const Bitmap& bitmap) {
+void PlatformWindow::present(const Bitmap& bitmap) {
     Impl& x = *impl_;
     if (!x.display || !x.window || bitmap.pixels.empty()) return;
     if (!x.image || x.image->width != bitmap.width || x.image->height != bitmap.height ||
@@ -167,7 +201,7 @@ void X11Window::present(const Bitmap& bitmap) {
     XFlush(x.display);
 }
 
-void X11Window::clipboard_set(const std::string& text) {
+void PlatformWindow::clipboard_set(const std::string& text) {
     Impl& x = *impl_;
     if (!x.display || !x.window) return;
     x.owned = text;
@@ -175,7 +209,7 @@ void X11Window::clipboard_set(const std::string& text) {
     XFlush(x.display);
 }
 
-std::string X11Window::clipboard_get() {
+std::string PlatformWindow::clipboard_get() {
     Impl& x = *impl_;
     if (!x.display || !x.window) return "";
     const Window owner = XGetSelectionOwner(x.display, x.clipboard);
@@ -201,31 +235,6 @@ std::string X11Window::clipboard_get() {
         XFree(data);
     }
     return text;
-}
-
-void X11Window::serve_selection(void* request_event) {
-    Impl& x = *impl_;
-    const XSelectionRequestEvent& request = static_cast<XEvent*>(request_event)->xselectionrequest;
-    XEvent reply{};
-    reply.xselection.type = SelectionNotify;
-    reply.xselection.requestor = request.requestor;
-    reply.xselection.selection = request.selection;
-    reply.xselection.target = request.target;
-    reply.xselection.time = request.time;
-    reply.xselection.property = None;
-    const Atom property = request.property != None ? request.property : request.target;
-    if (request.target == x.targets) {
-        const Atom offered[] = {x.targets, x.utf8, XA_STRING};
-        XChangeProperty(x.display, request.requestor, property, XA_ATOM, 32, PropModeReplace,
-                        reinterpret_cast<const unsigned char*>(offered), 3);
-        reply.xselection.property = property;
-    } else if (request.target == x.utf8 || request.target == XA_STRING) {
-        XChangeProperty(x.display, request.requestor, property, request.target, 8, PropModeReplace,
-                        reinterpret_cast<const unsigned char*>(x.owned.data()), int(x.owned.size()));
-        reply.xselection.property = property;
-    }
-    XSendEvent(x.display, request.requestor, False, 0, &reply);
-    XFlush(x.display);
 }
 
 }  // namespace autoreaper

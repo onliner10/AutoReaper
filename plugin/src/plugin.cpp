@@ -4,22 +4,27 @@
 // window is a code editor with a Compile button.
 #include "engine.h"
 #include "gui/ui.h"
-#ifdef __linux__
-#include "gui/x11_window.h"
-#endif
+#include "gui/window.h"
 
 #include <clap/clap.h>
 
 #include <algorithm>
+#include <cstdint>
 #include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <iterator>
 #include <memory>
 #include <string>
 
-#ifndef _WIN32
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
 #include <dlfcn.h>
 #endif
 
@@ -33,8 +38,21 @@ const char* kDefaultCode =
     "process = _, _;\n";
 constexpr int kDefaultWidth = 760, kDefaultHeight = 480;
 
+// The folder of this plugin's binary (inside the bundle on macOS).
 std::string plugin_dir() {
-#ifndef _WIN32
+#ifdef _WIN32
+    HMODULE module = nullptr;
+    wchar_t path[MAX_PATH * 4];
+    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           reinterpret_cast<LPCWSTR>(&plugin_dir), &module) &&
+        GetModuleFileNameW(module, path, DWORD(std::size(path)))) {
+        char utf8[MAX_PATH * 12];
+        if (WideCharToMultiByte(CP_UTF8, 0, path, -1, utf8, sizeof(utf8), nullptr, nullptr)) {
+            std::string file = utf8;
+            return file.substr(0, file.find_last_of("\\/"));
+        }
+    }
+#else
     Dl_info info;
     if (dladdr(reinterpret_cast<void*>(&plugin_dir), &info) && info.dli_fname) {
         std::string path = info.dli_fname;
@@ -50,15 +68,13 @@ bool same_code(const std::string& a, const std::string& b) {
     return a.compare(0, end(a), b, 0, end(b)) == 0;
 }
 
-#ifdef __linux__
 struct Gui {
-    std::unique_ptr<X11Window> window = std::make_unique<X11Window>();
+    std::unique_ptr<PlatformWindow> window = std::make_unique<PlatformWindow>();
     std::unique_ptr<Ui> ui;
     int width = kDefaultWidth, height = kDefaultHeight;
     clap_id timer = CLAP_INVALID_ID;
     std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
 };
-#endif
 
 struct Plugin {
     clap_plugin_t clap;
@@ -70,9 +86,7 @@ struct Plugin {
 
     State state;
     int revision = 0;  // bumped when code or draft change outside the window
-#ifdef __linux__
     std::unique_ptr<Gui> gui;
-#endif
 
     // The audio thread owns `current`. The main thread hands a new program over
     // in `next` and frees the replaced one from `retired`.
@@ -195,10 +209,9 @@ const clap_plugin_state_t kState = {state_save, state_load};
 
 // ------------------------------------------------------------------ window
 
-#ifdef __linux__
 void gui_tick(Plugin* p) {
     Gui& gui = *p->gui;
-    gui.window->pump(*gui.ui);
+    gui.window->pump();
     const auto now = std::chrono::steady_clock::now();
     const double seconds = std::chrono::duration<double>(now - gui.last).count();
     gui.last = now;
@@ -216,22 +229,23 @@ void gui_tick(Plugin* p) {
 }
 
 bool gui_is_api_supported(const clap_plugin_t*, const char* api, bool is_floating) {
-    return !is_floating && !std::strcmp(api, CLAP_WINDOW_API_X11);
+    return !is_floating && !std::strcmp(api, PlatformWindow::api());
 }
 
 bool gui_get_preferred_api(const clap_plugin_t*, const char** api, bool* is_floating) {
-    *api = CLAP_WINDOW_API_X11;
+    *api = PlatformWindow::api();
     *is_floating = false;
     return true;
 }
 
 bool gui_create(const clap_plugin_t* plugin, const char* api, bool is_floating) {
     Plugin* p = self(plugin);
-    if (is_floating || std::strcmp(api, CLAP_WINDOW_API_X11) || !p->host_timer) return false;
+    if (is_floating || std::strcmp(api, PlatformWindow::api()) || !p->host_timer) return false;
     auto gui = std::make_unique<Gui>();
-    X11Window* window = gui->window.get();
+    PlatformWindow* window = gui->window.get();
     gui->ui = std::make_unique<Ui>(Clipboard{[window] { return window->clipboard_get(); },
                                              [window](const std::string& text) { window->clipboard_set(text); }});
+    window->set_ui(gui->ui.get());
     gui->ui->resize(gui->width, gui->height);
     if (!p->host_timer->register_timer(p->host, 33, &gui->timer)) return false;
     p->gui = std::move(gui);
@@ -281,7 +295,15 @@ bool gui_set_size(const clap_plugin_t* plugin, uint32_t width, uint32_t height) 
 
 bool gui_set_parent(const clap_plugin_t* plugin, const clap_window_t* window) {
     Plugin* p = self(plugin);
-    return p->gui && p->gui->window->attach(window->x11, p->gui->width, p->gui->height);
+    if (!p->gui) return false;
+#if defined(_WIN32)
+    void* parent = window->win32;
+#elif defined(__APPLE__)
+    void* parent = window->cocoa;
+#else
+    void* parent = reinterpret_cast<void*>(uintptr_t(window->x11));
+#endif
+    return p->gui->window->attach(parent, p->gui->width, p->gui->height);
 }
 
 bool gui_set_transient(const clap_plugin_t*, const clap_window_t*) { return false; }
@@ -311,7 +333,6 @@ void timer_tick(const clap_plugin_t* plugin, clap_id timer) {
 }
 
 const clap_plugin_timer_support_t kTimer = {timer_tick};
-#endif
 
 // ------------------------------------------------------------------ plugin
 
@@ -325,9 +346,7 @@ bool plugin_init(const clap_plugin_t* plugin) {
 
 void plugin_destroy(const clap_plugin_t* plugin) {
     Plugin* p = self(plugin);
-#ifdef __linux__
     gui_destroy(plugin);
-#endif
     delete p->current;
     delete p->next.exchange(nullptr);
     p->free_retired();
@@ -442,10 +461,8 @@ const void* plugin_get_extension(const clap_plugin_t*, const char* id) {
     if (!std::strcmp(id, CLAP_EXT_AUDIO_PORTS)) return &kAudioPorts;
     if (!std::strcmp(id, CLAP_EXT_STATE)) return &kState;
     if (!std::strcmp(id, CLAP_EXT_NOTE_PORTS)) return &kNotePorts;
-#ifdef __linux__
     if (!std::strcmp(id, CLAP_EXT_GUI)) return &kGui;
     if (!std::strcmp(id, CLAP_EXT_TIMER_SUPPORT)) return &kTimer;
-#endif
     return nullptr;
 }
 

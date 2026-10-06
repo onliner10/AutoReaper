@@ -179,13 +179,16 @@ UiAction Ui::frame(const UiModel& model, double seconds) {
     ImGui::SetNextWindowSize(io.DisplaySize);
     ImGui::Begin("Faust", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
                                        ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoBringToFrontOnFocus);
-    if (ImGui::Button("Compile") || (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Enter, false))) action = UiAction::Compile;
+    // Ctrl+Enter, or Cmd+Enter on macOS (where ImGui's shortcut modifier is Super).
+    const bool shortcut = io.ConfigMacOSXBehaviors ? io.KeySuper : io.KeyCtrl;
+    if (ImGui::Button("Compile") || (shortcut && ImGui::IsKeyPressed(ImGuiKey_Enter, false))) action = UiAction::Compile;
     ImGui::SameLine();
     const bool draft = !model.draft.empty();
     if (draft && model.status == "error") {
         ImGui::TextColored(kRed, "Compile failed (see below); the last compiled code keeps running.");
     } else if (draft) {
-        ImGui::TextColored(kYellow, "Changed, not compiled: Compile (Ctrl+Enter) runs it.");
+        ImGui::TextColored(kYellow, io.ConfigMacOSXBehaviors ? "Changed, not compiled: Compile (Cmd+Enter) runs it."
+                                                              : "Changed, not compiled: Compile (Ctrl+Enter) runs it.");
     } else if (model.status == "ok") {
         ImGui::TextColored(kGreen, "Running. %d in, %d out (main 1-2, sidechain 3-4).", model.inputs, model.outputs);
     } else if (model.status == "error") {

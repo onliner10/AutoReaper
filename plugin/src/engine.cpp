@@ -9,8 +9,8 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <sstream>
-#include <sys/stat.h>
 
 // Faust's GUI keeps a list of every GUI (MidiUI is one); defined once here.
 std::list<GUI*> GUI::fGuiList;
@@ -59,8 +59,8 @@ void set_all(const std::vector<float*>& zones, double value) {
 }
 
 bool is_dir(const std::string& path) {
-    struct stat info;
-    return stat(path.c_str(), &info) == 0 && (info.st_mode & S_IFDIR);
+    std::error_code error;
+    return std::filesystem::is_directory(std::filesystem::u8path(path), error);
 }
 
 }  // namespace
@@ -75,9 +75,12 @@ Program::~Program() {
 std::vector<std::string> library_paths(const std::string& plugin_dir) {
     std::vector<std::string> candidates;
     if (const char* explicit_path = std::getenv("AUTOREAPER_FAUST_LIBRARIES")) candidates.push_back(explicit_path);
-    if (!plugin_dir.empty()) candidates.push_back(plugin_dir + "/faustlibraries");
+    if (!plugin_dir.empty()) {
+        candidates.push_back(plugin_dir + "/faustlibraries");
+        candidates.push_back(plugin_dir + "/../Resources/faustlibraries");  // inside a macOS bundle
+    }
     for (const char* path : {"/usr/share/faust", "/usr/local/share/faust", "/opt/homebrew/share/faust",
-                             "C:/Program Files/Faust/share/faust"})
+                             "C:/Program Files/Faust/share/faust", "C:/Program Files (x86)/Faust/share/faust"})
         candidates.push_back(path);
     std::vector<std::string> found;
     for (const auto& path : candidates)

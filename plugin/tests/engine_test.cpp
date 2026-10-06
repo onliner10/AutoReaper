@@ -1,4 +1,5 @@
 // Headless checks: compile, process (ducking keyed by the sidechain), errors, state.
+#define _USE_MATH_DEFINES  // M_PI on Windows
 #include "../src/engine.h"
 
 #include <cmath>

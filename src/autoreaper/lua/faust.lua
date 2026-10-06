@@ -81,9 +81,10 @@ local function state_span(track, index)
     start, at = found, found + 1
   end
   assert(start, 'This FX is not a CLAP plugin')
-  local first, last = chunk:find('<STATE\n', start, true)
+  -- Lines may end in \r\n (Windows); decode() skips the \r.
+  local first, last = chunk:find('<STATE\r?\n', start)
   assert(first and first < fxid, 'The plugin has no state in the track chunk')
-  local close = chunk:find('\n%s*>', last)
+  local close = chunk:find('\r?\n%s*>', last)
   return chunk, last + 1, close - 1
 end
 
