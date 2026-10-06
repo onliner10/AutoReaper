@@ -19,10 +19,11 @@ jobs:
       GH_TOKEN: ${{ github.token }}
     steps:
       - run: |
-          gh release download --repo grame-cncm/faust --pattern '*arm64.dmg' --dir dmg || gh release download --repo grame-cncm/faust --pattern '*.dmg' --dir dmg
+          gh release download --repo grame-cncm/faust --pattern 'Faust-*-arm64.dmg' --dir dmg
           ls -la dmg
           hdiutil attach dmg/*.dmg -mountpoint /Volumes/faust -nobrowse
-          find /Volumes/faust -maxdepth 4 | head -50
+          find /Volumes/faust -maxdepth 3 | head -40
+          find /Volumes/faust -path '*lib*' -maxdepth 4 | head -40
           for f in $(find /Volumes/faust -name 'libfaust*.dylib' -o -name 'libfaust*.a' | head -10); do ls -la "$f"; done
           for f in $(find /Volumes/faust -name 'libfaust*.dylib' | head -3); do echo "== $f"; otool -L "$f"; lipo -info "$f"; done
           find /Volumes/faust -name stdfaust.lib
@@ -44,9 +45,13 @@ jobs:
 
   linux:
     runs-on: ubuntu-24.04
+    env:
+      GH_TOKEN: ${{ github.token }}
     steps:
       - run: |
-          sudo apt-get update -q && sudo apt-get install -y -q faust libfaust-static
-          ls -la /usr/lib/x86_64-linux-gnu/libfaust*
-          ldd /usr/lib/x86_64-linux-gnu/libfaust.so
-          dpkg -L libfaust-static | head
+          gh release download --repo grame-cncm/faust --pattern 'libfaust-ubuntu-x86_64.zip'
+          unzip -q libfaust-ubuntu-x86_64.zip -d lf
+          find lf -maxdepth 4 | head -60
+          for f in $(find lf -name 'libfaust*.so*' -type f); do echo "== $f"; ls -la "$f"; ldd "$f"; done
+          find lf -name '*.a' -exec ls -la {} \;
+          find lf -name stdfaust.lib
