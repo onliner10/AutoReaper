@@ -26,6 +26,7 @@ struct HostZones {
 // scratch buffers so compute() can read silence for missing inputs and write
 // outputs nobody reads.
 struct Program {
+    Program();  // no instance: audio passes through
     ~Program();
     llvm_dsp_factory* factory = nullptr;
     dsp* instance = nullptr;

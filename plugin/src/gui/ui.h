@@ -25,7 +25,7 @@ struct UiModel {
     int revision = 0;      // bumped when code or draft change outside the editor
 };
 
-enum class UiAction { None, Compile };
+enum class UiAction { None, Compile, Revert };
 
 // Keys the editor uses; platform code maps its key codes to these.
 enum class Key { Unknown, Left, Right, Up, Down, Home, End, PageUp, PageDown, Backspace, Delete, Enter, Tab, Escape,
@@ -50,6 +50,7 @@ public:
     void modifiers(bool ctrl, bool shift, bool alt, bool super);
     void key(Key key, bool down);
     void text(unsigned int codepoint);
+    void text_utf16(unsigned short unit);  // one UTF-16 unit; surrogate pairs come in two calls
     void focus(bool focused);
 
     UiAction frame(const UiModel& model, double seconds);

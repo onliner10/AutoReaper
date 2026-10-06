@@ -110,7 +110,7 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpar
             ui.key(editor_key(wparam), message == WM_KEYDOWN || message == WM_SYSKEYDOWN);
             return 0;
         case WM_CHAR:
-            if (wparam >= 32 && wparam != 127) ui.text(unsigned(wparam));
+            if (wparam >= 32 && wparam != 127) ui.text_utf16((unsigned short)wparam);  // pairs arrive in two messages
             return 0;
         case WM_SETFOCUS: ui.focus(true); return 0;
         case WM_KILLFOCUS: ui.focus(false); return 0;
@@ -138,7 +138,11 @@ const char* PlatformWindow::api() { return CLAP_WINDOW_API_WIN32; }
 PlatformWindow::PlatformWindow() : impl_(new Impl) {}
 
 PlatformWindow::~PlatformWindow() {
-    if (impl_->window) DestroyWindow(impl_->window);
+    impl_->ui = nullptr;  // DestroyWindow sends focus and paint messages
+    if (impl_->window) {
+        SetWindowLongPtrW(impl_->window, GWLP_USERDATA, 0);
+        DestroyWindow(impl_->window);
+    }
     delete impl_;
 }
 

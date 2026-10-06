@@ -4,7 +4,7 @@
 -- compiles whatever state it is given and reports the result in its state.
 -- The server prepends this file (after fx.lua) to its Faust requests.
 local faust = {}
-faust.PLUGIN = 'CLAP:Faust (AutoReaper)'
+faust.PLUGIN = 'CLAP:com.autoreaper.faust'  -- TrackFX_AddByName takes the CLAP id
 faust.ID = 'com.autoreaper.faust'
 
 -- FNV-1a, 32 bit: the version of a piece of code, for edits that must not
@@ -68,9 +68,9 @@ function faust.serialize(code)
   return 'AutoReaperFaust 1\nstatus none\ninputs 0\noutputs 0\nmessages 0\n\ncode ' .. #code .. '\n' .. code .. '\n'
 end
 
--- The <STATE> block of one plugin in a track chunk, found by its FX GUID:
--- returns the chunk and the start and end of the block's base64 lines.
-local function state_span(track, index)
+-- The track chunk and where one plugin's block starts (its "<CLAP ..." line)
+-- and where its FXID line is; found by the FX GUID.
+local function clap_block(track, index)
   local _, chunk = reaper.GetTrackStateChunk(track, '', false)
   local guid = reaper.TrackFX_GetFXGUID(track, index)
   local fxid = assert(chunk:find('FXID ' .. guid, 1, true), 'FX ' .. guid .. ' is not in the track chunk')
@@ -80,6 +80,13 @@ local function state_span(track, index)
     if not found or found > fxid then break end
     start, at = found, found + 1
   end
+  return chunk, start, fxid
+end
+
+-- The <STATE> block of one plugin in a track chunk: returns the chunk and the
+-- start and end of the block's base64 lines.
+local function state_span(track, index)
+  local chunk, start, fxid = clap_block(track, index)
   assert(start, 'This FX is not a CLAP plugin')
   -- Lines may end in \r\n (Windows); decode() skips the \r.
   local first, last = chunk:find('<STATE\r?\n', start)
@@ -90,7 +97,24 @@ end
 
 function faust.is_faust(track, index)
   local _, ident = reaper.TrackFX_GetNamedConfigParm(track, index, 'fx_ident')
-  return ident ~= nil and ident:find(faust.ID, 1, true) ~= nil
+  if ident and ident ~= '' then return ident:find(faust.ID, 1, true) ~= nil end
+  -- An offline plugin has no fx_ident; its chunk line still names it: <CLAP "name" com.autoreaper.faust ...
+  local chunk, start = clap_block(track, index)
+  if not start then return false end
+  local line = chunk:sub(start, (chunk:find('\n', start, true) or #chunk + 1) - 1)
+  return line:find('" ' .. faust.ID, 1, true) ~= nil
+end
+
+-- Why the plugin is not running here, or nil: offline, or not installed on this
+-- computer (REAPER keeps the effect and its state, but nothing compiles or plays it).
+function faust.not_running(track, index)
+  local _, ident = reaper.TrackFX_GetNamedConfigParm(track, index, 'fx_ident')
+  if ident and ident ~= '' then return nil end
+  if reaper.TrackFX_GetOffline(track, index) then
+    return 'This Faust effect is offline, so it does not compile or play its code. Put it online with edit_fx.'
+  end
+  return 'The Faust (AutoReaper) plugin is not installed on this computer (or did not load): REAPER keeps the ' ..
+         'effect and its code, but nothing compiles or plays it. Install it with install_faust_plugin.'
 end
 
 -- The plugin's state, as it reports it now (REAPER asks it while building the chunk).
@@ -118,7 +142,7 @@ function faust.report(track, index, state)
   return {fx = fx.describe(track, index), code = state.code, version = state.version, status = state.status,
           faust_version = state.faust,
           messages = state.messages ~= '' and state.messages or nil, inputs = state.inputs, outputs = state.outputs,
-          draft = state.draft ~= '' and state.draft or nil}
+          draft = state.draft ~= '' and state.draft or nil, not_running = faust.not_running(track, index)}
 end
 
 return faust

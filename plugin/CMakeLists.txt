@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(autoreaper_faust VERSION 0.1.0 LANGUAGES CXX)
+project(autoreaper_faust VERSION 0.1.1 LANGUAGES CXX)
 if(APPLE)
     enable_language(OBJCXX)
 endif()
@@ -53,6 +53,14 @@ endif()
 add_library(autoreaper_faust MODULE src/plugin.cpp)
 target_link_libraries(autoreaper_faust PRIVATE clap autoreaper_faust_engine autoreaper_faust_ui)
 set_target_properties(autoreaper_faust PROPERTIES OUTPUT_NAME "AutoReaper Faust" CXX_VISIBILITY_PRESET hidden)
+target_compile_definitions(autoreaper_faust PRIVATE AUTOREAPER_FAUST_VERSION="${PROJECT_VERSION}")
+# Export only clap_entry: the ImGui and Faust code inside must not bind to, or
+# replace, the same symbols of other modules in REAPER (ReaImGui, say).
+set_target_properties(autoreaper_faust_engine autoreaper_faust_ui PROPERTIES
+    CXX_VISIBILITY_PRESET hidden VISIBILITY_INLINES_HIDDEN ON)
+if(NOT WIN32 AND NOT APPLE)
+    target_link_options(autoreaper_faust PRIVATE "LINKER:--exclude-libs,ALL" "LINKER:-Bsymbolic")
+endif()
 if(WIN32)
     target_sources(autoreaper_faust PRIVATE src/gui/window_win32.cpp)
     target_link_libraries(autoreaper_faust PRIVATE user32 gdi32)

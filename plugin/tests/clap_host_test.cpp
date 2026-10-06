@@ -137,6 +137,46 @@ int main(int argc, char** argv) {
     saved = save(plugin, state);
     CHECK(saved.find("status error") != std::string::npos && saved.find("nosuch") != std::string::npos);
 
+    // While active: code that does not compile stops the previous program (audio passes through).
+    CHECK(plugin->activate(plugin, 48000, 1, 512));
+    CHECK(plugin->start_processing(plugin));
+    CHECK(load_code(plugin, state, ducker));
+    CHECK(load_code(plugin, state, "process = _ : nosuch;"));
+    CHECK(plugin->process(plugin, &process) == CLAP_PROCESS_CONTINUE);
+    plugin->on_main_thread(plugin);
+    CHECK(plugin->process(plugin, &process) == CLAP_PROCESS_CONTINUE);
+    std::printf("after a failed load, with the key: %.4f (passes through)\n", ol[400]);
+    CHECK(std::fabs(ol[400] - 0.5f) < 1e-6f);
+
+    // A program too big for memory is refused, not crashed on.
+    CHECK(load_code(plugin, state, "process = _ @ int(hslider(\"d\", 0, 0, 300000000, 1)), _;"));
+    saved = save(plugin, state);
+    std::printf("huge delay: %s\n", saved.substr(saved.find("messages")).substr(0, 160).c_str());
+    CHECK(saved.find("status error") != std::string::npos && saved.find(" MB") != std::string::npos);
+    CHECK(plugin->process(plugin, &process) == CLAP_PROCESS_CONTINUE);
+
+    // A mono output port.
+    clap_audio_buffer_t mono_out[1] = {{out, nullptr, 1, 0, 0}};
+    clap_process_t mono{0, 512, nullptr, inputs, mono_out, 2, 1, &in_events, &out_events};
+    CHECK(load_code(plugin, state, ducker));
+    CHECK(plugin->process(plugin, &mono) == CLAP_PROCESS_CONTINUE);
+    plugin->on_main_thread(plugin);
+    CHECK(plugin->process(plugin, &mono) == CLAP_PROCESS_CONTINUE);
+    plugin->stop_processing(plugin);
+    plugin->deactivate(plugin);
+
+    // Damaged states are refused, quickly.
+    for (const std::string bad : {std::string("AutoReaperFaust 1\ncode 18446744073709551589\nx\n"),
+                                  std::string("AutoReaperFaust 1\ncode -5\nx\n"),
+                                  std::string("AutoReaperFaust 1\ncode 100\nshort\n"), std::string("garbage")}) {
+        Buffer buffer;
+        buffer.data = bad;
+        clap_istream_t stream{&buffer, read_stream};
+        CHECK(!state->load(plugin, &stream));
+    }
+    saved = save(plugin, state);
+    CHECK(saved.find(ducker) != std::string::npos);  // still the last good state
+
     plugin->destroy(plugin);
     entry->deinit();
     std::printf(failures ? "%d FAILED\n" : "all passed\n", failures);

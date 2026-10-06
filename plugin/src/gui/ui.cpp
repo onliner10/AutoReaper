@@ -103,6 +103,7 @@ Ui::Ui(Clipboard clipboard) : clipboard_(std::move(clipboard)) {
     ImGui::SetCurrentContext(context_);
     ImGuiIO& io = ImGui::GetIO();
     io.IniFilename = nullptr;
+    io.BackendFlags |= ImGuiBackendFlags_RendererHasVtxOffset;  // raster.cpp honours VtxOffset
     io.LogFilename = nullptr;
     io.ClipboardUserData = this;
     io.GetClipboardTextFn = [](void* user) -> const char* {
@@ -146,6 +147,7 @@ void Ui::mouse_move(float x, float y) { WITH_CONTEXT; ImGui::GetIO().AddMousePos
 void Ui::mouse_button(int button, bool down) { WITH_CONTEXT; ImGui::GetIO().AddMouseButtonEvent(button, down); RESTORE_CONTEXT; }
 void Ui::wheel(float steps) { WITH_CONTEXT; ImGui::GetIO().AddMouseWheelEvent(0, steps); RESTORE_CONTEXT; }
 void Ui::text(unsigned int codepoint) { WITH_CONTEXT; ImGui::GetIO().AddInputCharacter(codepoint); RESTORE_CONTEXT; }
+void Ui::text_utf16(unsigned short unit) { WITH_CONTEXT; ImGui::GetIO().AddInputCharacterUTF16(unit); RESTORE_CONTEXT; }
 void Ui::focus(bool focused) { WITH_CONTEXT; ImGui::GetIO().AddFocusEvent(focused); RESTORE_CONTEXT; }
 
 void Ui::modifiers(bool ctrl, bool shift, bool alt, bool super) {
@@ -193,13 +195,21 @@ UiAction Ui::frame(const UiModel& model, double seconds) {
     if (ImGui::Button("Compile") || (shortcut && ImGui::IsKeyPressed(ImGuiKey_Enter, false))) action = UiAction::Compile;
     ImGui::SameLine();
     const bool draft = !model.draft.empty();
+    if (draft) {
+        if (ImGui::Button("Revert")) action = UiAction::Revert;
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Drop the changes and show the running code again");
+        ImGui::SameLine();
+    }
     if (draft && model.status == "error") {
         ImGui::TextColored(kRed, "Compile failed (see below); the last compiled code keeps running.");
     } else if (draft) {
         ImGui::TextColored(kYellow, io.ConfigMacOSXBehaviors ? "Changed, not compiled: Compile (Cmd+Enter) runs it."
                                                               : "Changed, not compiled: Compile (Ctrl+Enter) runs it.");
     } else if (model.status == "ok") {
-        ImGui::TextColored(kGreen, "Running. %d in, %d out (main 1-2, sidechain 3-4).", model.inputs, model.outputs);
+        if (model.inputs == 1)
+            ImGui::TextColored(kGreen, "Running. Mono: 1 in (left channel only), %d out.", model.outputs);
+        else
+            ImGui::TextColored(kGreen, "Running. %d in, %d out (main 1-2, sidechain 3-4).", model.inputs, model.outputs);
     } else if (model.status == "error") {
         ImGui::TextColored(kRed, "This code does not compile; nothing runs (audio passes through).");
     } else {

@@ -15,9 +15,15 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <exception>
 #include <iterator>
 #include <memory>
 #include <string>
+#include <vector>
+
+#if defined(_M_X64) || defined(__x86_64__)
+#include <xmmintrin.h>
+#endif
 
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -68,12 +74,35 @@ bool same_code(const std::string& a, const std::string& b) {
     return a.compare(0, end(a), b, 0, end(b)) == 0;
 }
 
+// Members are destroyed in reverse order: the window first, while the Ui it
+// forwards its last events (focus loss on close) to still exists.
 struct Gui {
-    std::unique_ptr<PlatformWindow> window = std::make_unique<PlatformWindow>();
     std::unique_ptr<Ui> ui;
+    std::unique_ptr<PlatformWindow> window = std::make_unique<PlatformWindow>();
+    bool visible = false;
     int width = kDefaultWidth, height = kDefaultHeight;
     clap_id timer = CLAP_INVALID_ID;
     std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
+};
+
+// Flush denormals to zero while processing: decaying filters and reverbs
+// otherwise get very slow on some CPUs.
+class FlushDenormals {
+public:
+#if defined(_M_X64) || defined(__x86_64__)
+    FlushDenormals() : saved_(_mm_getcsr()) { _mm_setcsr(saved_ | 0x8040); }  // FTZ and DAZ
+    ~FlushDenormals() { _mm_setcsr(saved_); }
+private:
+    unsigned int saved_;
+#elif defined(__aarch64__) && !defined(_MSC_VER)
+    FlushDenormals() {
+        __asm__ __volatile__("mrs %0, fpcr" : "=r"(saved_));
+        __asm__ __volatile__("msr fpcr, %0" : : "r"(saved_ | (uint64_t(1) << 24)));  // FZ
+    }
+    ~FlushDenormals() { __asm__ __volatile__("msr fpcr, %0" : : "r"(saved_)); }
+private:
+    uint64_t saved_;
+#endif
 };
 
 struct Plugin {
@@ -85,7 +114,11 @@ struct Plugin {
     bool active = false;
 
     State state;
-    int revision = 0;  // bumped when code or draft change outside the window
+    int revision = 0;          // bumped when code or draft change outside the window
+    bool code_runs = false;    // state.code is the program that runs
+    bool pending = true;       // state.code not compiled yet (compiled at activation or when saved)
+    double compiled_rate = 0;  // the sample rate of the running program
+    std::vector<float> spare;  // an output channel the host does not give us
     std::unique_ptr<Gui> gui;
 
     // The audio thread owns `current`. The main thread hands a new program over
@@ -98,8 +131,16 @@ struct Plugin {
     // Compile on the main thread. On success the text becomes the running
     // code; on error the running program and code stay, with Faust's messages.
     bool try_compile(const std::string& text) {
-        auto result = compile(text, sample_rate, library_paths(plugin_dir()));
+        CompileResult result;
+        try {
+            result = compile(text, sample_rate, library_paths(plugin_dir()));
+        } catch (const std::exception& error) {
+            result.messages = std::string("Compiling failed: ") + error.what();
+        } catch (...) {
+            result.messages = "Compiling failed.";
+        }
         state.messages = result.messages;
+        pending = false;
         if (!result.program) {
             state.status = "error";
             return false;
@@ -108,14 +149,50 @@ struct Plugin {
         state.code = text;
         state.inputs = result.program->inputs;
         state.outputs = result.program->outputs;
+        code_runs = true;
+        compiled_rate = sample_rate;
         install(result.program.release());
         return true;
+    }
+
+    // Compile state.code; if it does not compile, nothing runs (audio passes
+    // through) rather than a program from earlier code.
+    void compile_code() {
+        if (try_compile(state.code)) return;
+        code_runs = false;
+        state.inputs = state.outputs = 0;
+        compiled_rate = sample_rate;
+        install(new Program());  // no instance: pass-through
     }
 
     // Compile what the window shows; a success clears the draft.
     void compile_draft() {
         const std::string text = state.draft.empty() ? state.code : state.draft;
         if (try_compile(text)) state.draft.clear();
+        mark_dirty();
+    }
+
+    // Drop the window's uncompiled changes; the running code shows again.
+    void revert_draft() {
+        state.draft.clear();
+        if (code_runs) {
+            state.status = "ok";
+            state.messages.clear();
+        }
+        ++revision;
+        mark_dirty();
+    }
+
+    // The editor's text changed: it is a draft unless it is the running code.
+    void set_draft(const std::string& text) {
+        const std::string draft = same_code(text, state.code) ? "" : text;
+        if (draft == state.draft) return;
+        state.draft = draft;
+        // Back to the running code: the failed compile of a draft no longer applies.
+        if (draft.empty() && code_runs && state.status == "error") {
+            state.status = "ok";
+            state.messages.clear();
+        }
         mark_dirty();
     }
 
@@ -174,8 +251,10 @@ const clap_plugin_note_ports_t kNotePorts = {note_ports_count, note_ports_get};
 
 // ------------------------------------------------------------------ state
 
-bool state_save(const clap_plugin_t* plugin, const clap_ostream_t* stream) {
-    const std::string data = serialize(self(plugin)->state);
+bool state_save(const clap_plugin_t* plugin, const clap_ostream_t* stream) try {
+    Plugin* p = self(plugin);
+    if (p->pending) p->compile_code();  // report this computer's compile, not the loaded one
+    const std::string data = serialize(p->state);
     size_t written = 0;
     while (written < data.size()) {
         const int64_t n = stream->write(stream, data.data() + written, data.size() - written);
@@ -183,26 +262,43 @@ bool state_save(const clap_plugin_t* plugin, const clap_ostream_t* stream) {
         written += size_t(n);
     }
     return true;
+} catch (...) {
+    return false;
 }
 
 // Loading (a project, or new code from AutoReaper) always compiles the code;
-// if it does not compile, it is kept so that saving does not lose it.
-bool state_load(const clap_plugin_t* plugin, const clap_istream_t* stream) {
+// if it does not compile, it is kept so that saving does not lose it, and
+// nothing runs. A plugin not yet activated (a project opening) compiles once
+// it knows the sample rate.
+bool state_load(const clap_plugin_t* plugin, const clap_istream_t* stream) try {
+    constexpr size_t kMaxState = size_t(64) << 20;
     std::string data;
     char buffer[4096];
     for (;;) {
         const int64_t n = stream->read(stream, buffer, sizeof(buffer));
         if (n < 0) return false;
         if (n == 0) break;
+        if (data.size() + size_t(n) > kMaxState) return false;
         data.append(buffer, size_t(n));
     }
     State loaded;
     if (!deserialize(data, loaded)) return false;
     Plugin* p = self(plugin);
-    if (!p->try_compile(loaded.code)) p->state.code = loaded.code;
+    p->state.code = loaded.code;
+    if (p->active) {
+        p->compile_code();
+    } else {
+        p->pending = true;
+        p->state.status = loaded.status;
+        p->state.messages = loaded.messages;
+        p->state.inputs = loaded.inputs;
+        p->state.outputs = loaded.outputs;
+    }
     p->state.draft = same_code(loaded.draft, p->state.code) ? "" : loaded.draft;
     ++p->revision;
     return true;
+} catch (...) {
+    return false;
 }
 
 const clap_plugin_state_t kState = {state_save, state_load};
@@ -215,16 +311,14 @@ void gui_tick(Plugin* p) {
     const auto now = std::chrono::steady_clock::now();
     const double seconds = std::chrono::duration<double>(now - gui.last).count();
     gui.last = now;
+    if (!gui.visible) return;
     UiModel model{p->state.code, p->state.draft, p->state.status, p->state.messages, p->state.inputs,
                   p->state.outputs, p->revision};
     const UiAction action = gui.ui->frame(model, seconds);
     std::string text;
-    if (gui.ui->edited(text)) {
-        const bool was_draft = !p->state.draft.empty();
-        p->state.draft = same_code(text, p->state.code) ? "" : text;
-        if (!was_draft && !p->state.draft.empty()) p->mark_dirty();
-    }
+    if (gui.ui->edited(text)) p->set_draft(text);
     if (action == UiAction::Compile) p->compile_draft();
+    if (action == UiAction::Revert) p->revert_draft();
     gui.window->present(gui.ui->bitmap());
 }
 
@@ -238,7 +332,7 @@ bool gui_get_preferred_api(const clap_plugin_t*, const char** api, bool* is_floa
     return true;
 }
 
-bool gui_create(const clap_plugin_t* plugin, const char* api, bool is_floating) {
+bool gui_create(const clap_plugin_t* plugin, const char* api, bool is_floating) try {
     Plugin* p = self(plugin);
     if (is_floating || std::strcmp(api, PlatformWindow::api()) || !p->host_timer) return false;
     auto gui = std::make_unique<Gui>();
@@ -250,12 +344,15 @@ bool gui_create(const clap_plugin_t* plugin, const char* api, bool is_floating) 
     if (!p->host_timer->register_timer(p->host, 33, &gui->timer)) return false;
     p->gui = std::move(gui);
     return true;
+} catch (...) {
+    return false;
 }
 
 void gui_destroy(const clap_plugin_t* plugin) {
     Plugin* p = self(plugin);
     if (!p->gui) return;
     p->host_timer->unregister_timer(p->host, p->gui->timer);
+    p->gui->window->set_ui(nullptr);  // no more events to the Ui while the window closes
     p->gui.reset();
 }
 
@@ -313,6 +410,7 @@ bool gui_show(const clap_plugin_t* plugin) {
     Plugin* p = self(plugin);
     if (!p->gui) return false;
     p->gui->window->show(true);
+    p->gui->visible = true;
     return true;
 }
 
@@ -320,6 +418,7 @@ bool gui_hide(const clap_plugin_t* plugin) {
     Plugin* p = self(plugin);
     if (!p->gui) return false;
     p->gui->window->show(false);
+    p->gui->visible = false;
     return true;
 }
 
@@ -340,7 +439,7 @@ bool plugin_init(const clap_plugin_t* plugin) {
     Plugin* p = self(plugin);
     p->host_state = static_cast<const clap_host_state_t*>(p->host->get_extension(p->host, CLAP_EXT_STATE));
     p->host_timer = static_cast<const clap_host_timer_support_t*>(p->host->get_extension(p->host, CLAP_EXT_TIMER_SUPPORT));
-    p->try_compile(kDefaultCode);
+    p->state.code = kDefaultCode;  // compiled at activation, unless a state comes first
     return true;
 }
 
@@ -353,14 +452,16 @@ void plugin_destroy(const clap_plugin_t* plugin) {
     delete p;
 }
 
-bool plugin_activate(const clap_plugin_t* plugin, double sample_rate, uint32_t, uint32_t) {
+bool plugin_activate(const clap_plugin_t* plugin, double sample_rate, uint32_t, uint32_t max_frames) try {
     Plugin* p = self(plugin);
-    if (sample_rate != p->sample_rate) {
-        p->sample_rate = sample_rate;
-        p->try_compile(p->state.code);  // Faust programs are initialised for one rate
-    }
+    p->sample_rate = sample_rate;
+    // Faust programs are initialised for one rate.
+    if (p->pending || sample_rate != p->compiled_rate) p->compile_code();
+    p->spare.assign(std::max<uint32_t>(max_frames, 1), 0.f);
     p->active = true;
     return true;
+} catch (...) {
+    return false;
 }
 
 void plugin_deactivate(const clap_plugin_t* plugin) {
@@ -376,7 +477,8 @@ void plugin_deactivate(const clap_plugin_t* plugin) {
 bool plugin_start_processing(const clap_plugin_t*) { return true; }
 void plugin_stop_processing(const clap_plugin_t*) {}
 void plugin_reset(const clap_plugin_t* plugin) {
-    if (Program* program = self(plugin)->current) reset(*program);
+    Program* program = self(plugin)->current;
+    if (program && program->instance) reset(*program);
 }
 
 clap_process_status plugin_process(const clap_plugin_t* plugin, const clap_process_t* process) {
@@ -399,9 +501,16 @@ clap_process_status plugin_process(const clap_plugin_t* plugin, const clap_proce
         }
         input_count = int(port * 2 + 2);
     }
-    if (process->audio_outputs_count < 1 || process->audio_outputs[0].channel_count < 2) return CLAP_PROCESS_CONTINUE;
-    float* const* outputs = process->audio_outputs[0].data32;
+    if (process->audio_outputs_count < 1 || process->audio_outputs[0].channel_count < 1 ||
+        !process->audio_outputs[0].data32)
+        return CLAP_PROCESS_CONTINUE;
+    clap_audio_buffer_t& output = process->audio_outputs[0];
+    output.constant_mask = 0;
     const int frames = int(process->frames_count);
+    if (output.channel_count < 2 && size_t(frames) > p->spare.size()) return CLAP_PROCESS_ERROR;
+    // A mono output gets the left channel; the right goes to a spare buffer.
+    float* const outputs[2] = {output.data32[0], output.channel_count > 1 ? output.data32[1] : p->spare.data()};
+    FlushDenormals flush;
 
     // Notes and MIDI messages, in time order as CLAP delivers them.
     int midi_count = 0;
@@ -446,7 +555,7 @@ clap_process_status plugin_process(const clap_plugin_t* plugin, const clap_proce
         }
     }
 
-    if (p->current) {
+    if (p->current && p->current->instance) {
         run(*p->current, inputs, input_count, outputs, frames, transport, p->midi.data(), midi_count);
     } else {
         for (int side = 0; side < 2; ++side) {
@@ -471,8 +580,8 @@ void plugin_on_main_thread(const clap_plugin_t* plugin) { self(plugin)->free_ret
 const char* kFeatures[] = {CLAP_PLUGIN_FEATURE_AUDIO_EFFECT, CLAP_PLUGIN_FEATURE_STEREO, nullptr};
 
 const clap_plugin_descriptor_t kDescriptor = {
-    CLAP_VERSION_INIT, "com.autoreaper.faust", "Faust (AutoReaper)", "AutoReaper",
-    "https://github.com/onliner10/AutoReaper", "", "", "0.1.0",
+    CLAP_VERSION_INIT, "com.autoreaper.faust", "Faust", "AutoReaper",
+    "https://github.com/onliner10/AutoReaper", "", "", AUTOREAPER_FAUST_VERSION,
     "Runs Faust code compiled in place; the code is stored with the project.", kFeatures};
 
 const clap_plugin_t* create_plugin(const clap_plugin_factory_t*, const clap_host_t* host, const char* id) {
