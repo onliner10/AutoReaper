@@ -21,6 +21,25 @@ another computer, and the code comes along. Undo restores earlier code.
 - **Unfinished edits**: code changed in the window and not compiled yet is kept in the state too (as a draft),
   so saving the project keeps it, and AutoReaper's `edit_faust_fx` refuses to overwrite it.
 
+## Install a package
+
+The package workflow (`.github/workflows/package.yml`) builds a zip per system that includes libfaust and the
+Faust libraries (Faust 2.88.0), so no Faust install is needed: `autoreaper-faust-windows-x64`,
+`-macos-arm64`, `-macos-x64` and `-linux-x64`. Each holds a folder `AutoReaper Faust` with `INSTALL.txt`:
+
+| System | Copy | To |
+|---|---|---|
+| Windows | the folder `AutoReaper Faust` (plugin, `faust.dll`, `faustlibraries`) | `%LOCALAPPDATA%\Programs\Common\CLAP` or `C:\Program Files\Common Files\CLAP` |
+| macOS | `AutoReaper Faust.clap` (a bundle with libfaust inside) | `~/Library/Audio/Plug-Ins/CLAP` |
+| Linux | the folder `AutoReaper Faust` (plugin, `libfaust.so.2`, `faustlibraries`) | `~/.clap` |
+
+Then in REAPER: Options > Preferences > Plug-ins > CLAP > Re-scan. Windows needs the Microsoft Visual C++
+Redistributable (x64), which most computers have. The macOS bundle is signed ad hoc, not notarized: if macOS
+blocks a downloaded copy, run `xattr -dr com.apple.quarantine ~/Library/Audio/Plug-Ins/CLAP/"AutoReaper Faust.clap"`.
+
+To make a package yourself: build with `-DAUTOREAPER_PACKAGE=ON` against a Faust release (its `lib`, `include`,
+`share/faust`), then `python plugin/package.py --build plugin/build --faust <Faust release> --out dist`.
+
 ## Build
 
 Needs CMake 3.20+, a C++17 compiler and Faust with libfaust (2.60+); on Linux also the X11 headers. CMake
@@ -65,8 +84,7 @@ editor triggers actions, enable "Send all keyboard input to plug-in" in the FX w
 | The window in a host: editing, keyboard, clipboard, Compile, errors | tested in REAPER 7.81 | written, not yet tried in a host | written, not yet tried in a host |
 | In REAPER: project save and reopen, AutoReaper's tools, sidechains | tested in REAPER 7.81 | not yet tried | not yet tried |
 
-The plugin uses the Faust installed on the computer (libfaust and its libraries). A release for users would
-bundle libfaust and the libraries beside the plugin instead; that is not done yet.
+A plain build uses the Faust installed on the computer; a package carries its own (see Install a package).
 
 ## State format
 
