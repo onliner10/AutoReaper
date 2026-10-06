@@ -93,7 +93,7 @@ jobs:
 
       - name: Package
         shell: bash
-        run: python plugin/package.py --build build --faust "$FAUST_ROOT" --out dist --name "autoreaper-faust-${{ matrix.target }}"
+        run: python plugin/package.py --build build --faust "$FAUST_ROOT" --faust-version "$FAUST_VERSION" --out dist --name "autoreaper-faust-${{ matrix.target }}"
 
       - name: Keep the host test for the clean runner
         shell: bash
@@ -141,6 +141,7 @@ jobs:
           unzip -q "autoreaper-faust-${{ matrix.target }}.zip"
           find "AutoReaper Faust" -maxdepth 3 | head -20
           cat "AutoReaper Faust/INSTALL.txt"
+          grep -q "with Faust $FAUST_VERSION included" "AutoReaper Faust/INSTALL.txt"
           chmod +x tools/clap_host_test* || true
           if [ "${{ matrix.rosetta }}" = true ]; then arch -x86_64 tools/clap_host_test "AutoReaper Faust/AutoReaper Faust.clap"
           else tools/clap_host_test* "AutoReaper Faust/AutoReaper Faust.clap"; fi

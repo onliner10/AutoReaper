@@ -1,6 +1,6 @@
 """Package the built plugin with libfaust and the Faust libraries, for users without Faust.
 
-    python plugin/package.py --build plugin/build --faust <Faust root> --out dist [--name <zip name>]
+    python plugin/package.py --build plugin/build --faust <Faust root> --out dist [--faust-version X.Y.Z] [--name <zip name>]
 
 The Faust root is a Faust release laid out as lib/ (libfaust), share/faust/ (the .lib files)
 and, optionally, a license file. Build the plugin with -DAUTOREAPER_PACKAGE=ON first, so it
@@ -129,11 +129,12 @@ def main():
     parser.add_argument('--build', type=Path, required=True)
     parser.add_argument('--faust', type=Path, required=True, help='Faust release root (lib/, share/faust/)')
     parser.add_argument('--out', type=Path, required=True)
+    parser.add_argument('--faust-version', help='the Faust release, for INSTALL.txt (e.g. 2.88.0)')
     parser.add_argument('--name', help='zip file name without .zip (default: by system)')
     args = parser.parse_args()
     version = re.search(r'project\(\S+ VERSION (\S+)', (REPOSITORY / 'plugin' / 'CMakeLists.txt').read_text()).group(1)
-    faust = re.search(r'(\d+\.\d+\.\d+)', str(args.faust.resolve())) or re.search(
-        r'(\d+\.\d+\.\d+)', ' '.join(p.name for p in (args.faust / 'lib').iterdir()))
+    faust = args.faust_version or next((m.group(1) for p in (args.faust / 'lib').iterdir()
+                                        if (m := re.fullmatch(r'libfaust\.(\d+\.\d+\.\d+)\.dylib', p.name))), '?')
     staging = args.out / 'staging'
     shutil.rmtree(staging, ignore_errors=True)
     folder = staging / NAME  # everything goes in here; the zip holds this folder
@@ -146,7 +147,7 @@ def main():
     else:
         package_linux(args.build, args.faust, folder)
         item, notes = f'the folder "{NAME}"', NOTES['linux']
-    (folder / 'INSTALL.txt').write_text(INSTALL.format(version=version, faust=faust.group(1) if faust else '?',
+    (folder / 'INSTALL.txt').write_text(INSTALL.format(version=version, faust=faust,
                                                        item=item, notes=notes), encoding='utf-8')
     shutil.copy2(REPOSITORY / 'LICENSE', folder / 'LICENSE')
     faust_license(args.faust, folder)
