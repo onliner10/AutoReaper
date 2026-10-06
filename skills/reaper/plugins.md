@@ -121,9 +121,10 @@ track, a gain or filter utility, a gate, a custom envelope. Prefer the standard 
   ```
 
   Then `sidechain_send` from the key track, `kind: "audio"`, `channels: 3`, `fx: <the effect>`.
-- **MIDI sidechain**: a control marked `[midi:key 36]` is 1 while note 36 is held (velocity / 127), on the exact
-  frame; `[midi:keyon 36]` keeps the last velocity, `[midi:ctrl 1]` follows a CC; add a channel
-  (`[midi:key 36 10]`) to react to one channel only. Route the notes with `sidechain_send` `kind: "midi"`.
+- **MIDI sidechain**: a control marked `[midi:key 36]` is the note's velocity / 127 while note 36 is held and 0
+  after it (compare `> 0` for on/off), on the exact frame; `[midi:keyon 36]` keeps the last velocity,
+  `[midi:ctrl 1]` follows a CC; add a channel (`[midi:key 36 10]`) to react to one channel only. Route the notes
+  with `sidechain_send` `kind: "midi"`.
 
   ```faust
   kick = button("kick [midi:key 36]") > 0;

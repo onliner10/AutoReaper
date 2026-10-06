@@ -835,7 +835,8 @@ async def read_faust_fx(track: TrackRef, fx: FxRef) -> str:
     """Read a Faust effect: the code it runs, its version (pass it to edit_faust_fx), the last compile's status and
     Faust's messages, inputs and outputs, and faust_version (the libfaust it compiles with; its manual comes from
     the reaper skill's faust_docs.py). draft is code the user has changed in the plugin window and not compiled
-    yet; while there is one, edit_faust_fx refuses so the user's work is not overwritten."""
+    yet; while there is one, edit_faust_fx refuses so the user's work is not overwritten. not_running, if present,
+    says why nothing runs the code here (the effect is offline, or the plugin is not installed on this computer)."""
     try:
         return output(await read_query(faust_program(READ_FAUST_FX, track=track, fx=fx), 'Read Faust FX'), 'read_faust_fx')
     except Exception as error:
@@ -845,6 +846,11 @@ async def read_faust_fx(track: TrackRef, fx: FxRef) -> str:
 EDIT_FAUST_FX = FAUST_FX_OF + '''
 local track, track_name, index = faust_fx(args.track, args.fx)
 local before = faust.read(track, index)
+local not_running = faust.not_running(track, index)
+if not_running then
+  return {ok = false, changed = false, code = before.code, version = before.version,
+          error = not_running .. ' Nothing was changed.'}
+end
 if before.draft ~= '' then
   return {ok = false, conflict = true, changed = false, draft = before.draft, code = before.code, version = before.version,
           error = 'The user is editing this code in the plugin window (changes not compiled yet); nothing was changed. ' ..

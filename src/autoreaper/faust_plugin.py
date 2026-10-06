@@ -24,7 +24,7 @@ import httpx
 
 NAME = 'AutoReaper Faust'
 # The plugin version this server works with; plugin/CMakeLists.txt has the same (a test checks).
-VERSION = '0.1.0'
+VERSION = '0.1.1'
 RELEASES = 'https://github.com/onliner10/AutoReaper/releases/download'
 TARGETS = ('windows-x64', 'macos-arm64', 'macos-x64', 'linux-x64')
 VC_REDIST = 'https://aka.ms/vs/17/release/vc_redist.x64.exe'

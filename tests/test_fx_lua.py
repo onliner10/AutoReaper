@@ -262,3 +262,26 @@ def test_faust_state_in_a_track_chunk(newline):
     after = faust.write(None, 1, faust.serialize('process = _;\n'))
     assert after.code == 'process = _;\n'
     assert 'NAME LEAD' in runtime.globals().chunk and 'AAAA' in runtime.globals().chunk  # the rest untouched
+
+
+@pytest.mark.parametrize('offline', [True, False])
+def test_faust_effect_known_when_not_running(offline):
+    """An offline or missing plugin has no fx_ident; its chunk line still names it, and not_running says why."""
+    runtime = lua_module.LuaRuntime(unpack_returned_tuples=True)
+    faust = runtime.execute((LUA / 'faust.lua').read_text(encoding='utf-8'))
+    lines = ['<TRACK', '<FXCHAIN', '<VST "VST: Other" other.so', 'AAAA', '>',
+             'FXID {11111111-0000-0000-0000-000000000000}',
+             '<CLAP "CLAP: Faust (AutoReaper)" com.autoreaper.faust Ducker', 'CFG 4 0 0 ""', '<STATE', 'QUFB', '>', '>',
+             'FXID {22222222-0000-0000-0000-000000000000}', '>', '>']
+    runtime.globals().chunk = '\n'.join(lines) + '\n'
+    runtime.globals().offline = offline
+    runtime.execute('''
+      local guids = {[0] = '{11111111-0000-0000-0000-000000000000}', [1] = '{22222222-0000-0000-0000-000000000000}'}
+      reaper = {
+        GetTrackStateChunk = function() return true, chunk end,
+        TrackFX_GetFXGUID = function(_, i) return guids[i] end,
+        TrackFX_GetNamedConfigParm = function() return true, '' end,
+        TrackFX_GetOffline = function() return offline end,
+      }''')
+    assert faust.is_faust(None, 1) and not faust.is_faust(None, 0)
+    assert ('offline' if offline else 'not installed') in faust.not_running(None, 1)

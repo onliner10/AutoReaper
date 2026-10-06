@@ -27,6 +27,9 @@ namespace autoreaper {
 namespace {
 
 constexpr int kCapacity = 1024;
+// One instance may use at most this much memory (its delay lines and tables):
+// more would fail to allocate on some systems, or take seconds to clear.
+constexpr size_t kMaxInstanceBytes = size_t(512) << 20;
 constexpr int kGrid = 48;         // host controls change on this fraction of a quarter note
 constexpr int kHostStep = 32;     // and at least this often (frames)
 
@@ -60,28 +63,59 @@ struct HostZonesUI : public UI {
     void addSoundfile(const char*, const char*, Soundfile**) override {}
 };
 
+// Allocates instances, refusing ones above kMaxInstanceBytes (libfaust then
+// returns no instance instead of one whose memory is missing).
+struct CappedMemory : public dsp_memory_manager {
+    size_t refused = 0;  // the size of the last refused request
+    void* allocate(size_t size) override {
+        if (size > kMaxInstanceBytes) {
+            refused = size;
+            return nullptr;
+        }
+        return std::calloc(1, size);
+    }
+    void destroy(void* ptr) override { std::free(ptr); }
+};
+
+CappedMemory& capped_memory() {
+    static CappedMemory memory;  // outlives every factory and instance
+    return memory;
+}
+
 #if defined(_M_X64) || defined(__x86_64__)
-// AVX2 and FMA, with the OS saving the AVX registers (a VM can hide them).
-bool avx2_usable() {
-    unsigned int a, b, c, d;
+// Everything x86-64-v3 adds (AVX, AVX2, FMA, BMI1, BMI2, LZCNT, MOVBE, F16C),
+// with the OS saving the AVX registers: a VM can hide any of them.
+bool v3_usable() {
+    unsigned int leaf1_c, leaf7_b, ext_c;
 #if defined(_M_X64)
     int r[4];
     __cpuid(r, 1);
-    c = unsigned(r[2]);
-    if (!(c & (1u << 27)) || !(c & (1u << 28)) || !(c & (1u << 12))) return false;  // OSXSAVE, AVX, FMA
-    if ((_xgetbv(0) & 6) != 6) return false;                                          // XMM and YMM state
+    leaf1_c = unsigned(r[2]);
     __cpuidex(r, 7, 0);
-    b = unsigned(r[1]);
-    (void)a; (void)d;
+    leaf7_b = unsigned(r[1]);
+    __cpuid(r, 0x80000001);
+    ext_c = unsigned(r[2]);
+    const bool ymm_saved = (leaf1_c & (1u << 27)) && (_xgetbv(0) & 6) == 6;
 #else
+    unsigned int a, b, c, d;
     if (!__get_cpuid(1, &a, &b, &c, &d)) return false;
-    if (!(c & (1u << 27)) || !(c & (1u << 28)) || !(c & (1u << 12))) return false;
-    unsigned int low, high;
-    __asm__("xgetbv" : "=a"(low), "=d"(high) : "c"(0));
-    if ((low & 6) != 6) return false;
+    leaf1_c = c;
     if (!__get_cpuid_count(7, 0, &a, &b, &c, &d)) return false;
+    leaf7_b = b;
+    if (!__get_cpuid(0x80000001, &a, &b, &c, &d)) return false;
+    ext_c = c;
+    bool ymm_saved = false;
+    if (leaf1_c & (1u << 27)) {  // OSXSAVE
+        unsigned int low, high;
+        __asm__("xgetbv" : "=a"(low), "=d"(high) : "c"(0));
+        ymm_saved = (low & 6) == 6;
+    }
 #endif
-    return (b & (1u << 5)) != 0;  // AVX2
+    const bool leaf1 = (leaf1_c & (1u << 28)) && (leaf1_c & (1u << 12)) && (leaf1_c & (1u << 22)) &&
+                       (leaf1_c & (1u << 29));                                  // AVX, FMA, MOVBE, F16C
+    const bool leaf7 = (leaf7_b & (1u << 5)) && (leaf7_b & (1u << 3)) && (leaf7_b & (1u << 8));  // AVX2, BMI1, BMI2
+    const bool lzcnt = (ext_c & (1u << 5)) != 0;
+    return ymm_saved && leaf1 && leaf7 && lzcnt;
 }
 #endif
 
@@ -95,6 +129,8 @@ bool is_dir(const std::string& path) {
 }
 
 }  // namespace
+
+Program::Program() = default;
 
 Program::~Program() {
     midi_ui.reset();  // its zones live in the instance
@@ -110,7 +146,7 @@ Program::~Program() {
 std::string jit_target() {
 #if defined(_M_X64) || defined(__x86_64__)
     const std::string host = getDSPMachineTarget();
-    return host.substr(0, host.find(':')) + (avx2_usable() ? ":x86-64-v3" : ":x86-64-v2");
+    return host.substr(0, host.find(':')) + (v3_usable() ? ":x86-64-v3" : ":x86-64-v2");
 #else
     return "";  // the host's own target
 #endif
@@ -147,9 +183,19 @@ CompileResult compile(const std::string& code, double sample_rate, const std::ve
     }
     auto program = std::make_unique<Program>();
     program->factory = factory;
+    CappedMemory& memory = capped_memory();
+    memory.refused = 0;
+    factory->setMemoryManager(&memory);
     program->instance = factory->createDSPInstance();
     if (!program->instance) {
-        result.messages = "Faust compiled the code but could not create an instance.";
+        if (memory.refused)
+            // libfaust counts the size in an int: past 2 GB it reads as a huge value.
+            result.messages = "This program needs " +
+                              (memory.refused >> 31 ? std::string("more than 2048") : std::to_string(memory.refused >> 20)) +
+                              " MB for its delay lines and tables; the limit is " +
+                              std::to_string(kMaxInstanceBytes >> 20) + " MB. Use shorter delays or tables.";
+        else
+            result.messages = "Faust compiled the code but could not create an instance.";
         return result;
     }
     program->instance->init(int(sample_rate));
@@ -266,8 +312,9 @@ bool deserialize(const std::string& data, State& state) {
         if (space == std::string::npos) continue;
         const std::string key = line.substr(0, space), value = line.substr(space + 1);
         if (key == "messages" || key == "code" || key == "draft") {
+            if (value.empty() || value.find_first_not_of("0123456789") != std::string::npos) return false;
             const size_t size = std::strtoull(value.c_str(), nullptr, 10);
-            if (at + size > data.size()) return false;
+            if (at > data.size() || size > data.size() - at) return false;
             (key == "code" ? parsed.code : key == "draft" ? parsed.draft : parsed.messages) = data.substr(at, size);
             at += size + 1;
         } else if (key == "status") {
