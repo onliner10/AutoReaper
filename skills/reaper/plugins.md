@@ -77,6 +77,34 @@ Bus 2. After that set the plugin's trigger/sidechain mode to MIDI.
 **Host-synced ducking** (a plugin's own tempo-synced envelope) keeps pumping where the kick pauses;
 MIDI triggering follows the actual kick notes. Say which one you chose and why.
 
+## Faust effects
+
+When no installed plugin does the job simply, and the user agrees, write the effect in Faust with
+`add_faust_fx`. It runs in the Faust (AutoReaper) plugin; the user sees and edits the code in its window, and the
+project stores it. Use it for small, precise processing you can state in a few lines: a ducker keyed by another
+track, a gain or filter utility, a gate, a custom envelope. Prefer the standard library (`import("stdfaust.lib");`:
+`an.amp_follower_ar`, `ba.db2linear`, `si.smoo`, `fi.lowpass`, `co.compressor_stereo`, ...).
+
+- Inputs are main L, R, then sidechain L, R; outputs L, R. A sidechain ducker:
+
+  ```faust
+  import("stdfaust.lib");
+  depth = -9;          // dB while the key is loud
+  threshold = 0.05;    // key level that starts the ducking
+  key(kl, kr) = (abs(kl) + abs(kr)) / 2 : an.amp_follower_ar(0.002, 0.15);
+  gain(kl, kr) = ba.db2linear(depth * (key(kl, kr) > threshold)) : si.smoo;
+  process(l, r, kl, kr) = l * g, r * g with { g = gain(kl, kr); };
+  ```
+
+  Then `sidechain_send` from the key track, `kind: "audio"`, `channels: 3`, `fx: <the effect>`.
+- Write settings as named constants with a comment, so the user can read and change them in the window.
+- If the code does not compile, nothing is added (or the edit is not applied) and `messages` has Faust's errors
+  (`faust : <line> : ERROR : ...`, lines counted from the first line of your code). Fix and retry.
+- To change it, `read_faust_fx` first and pass its `version` to `edit_faust_fx`. A refusal means the user changed
+  the code or is editing it (`draft`): show them what you wanted to change instead of overwriting.
+- Measure the result like any plugin: `capture` before and after, `analyze.py --steps 16` for ducking.
+- If `add_faust_fx` says the plugin is missing, tell the user it is built from the repository's `plugin/` folder.
+
 ## Raw REAPER API for anything else
 
 `reaper_eval` reads and `reaper_eval_write` changes anything the tools above do not cover, for example:

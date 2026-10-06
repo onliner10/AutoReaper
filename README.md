@@ -28,6 +28,9 @@ It has two parts:
 | `edit_fx` | Bypass, enable, offline, remove, move or show a plugin |
 | `sidechain_send` | Audio sidechain (send, track channels, plugin pins) or MIDI trigger send on a MIDI bus |
 | `capture` | Renders a bar or time range (full mix or tracks soloed by GUID or name) offline to a WAV |
+| `add_faust_fx` | Adds an effect written in Faust (needs the Faust plugin below); nothing is added if it does not compile |
+| `read_faust_fx` | A Faust effect's code, version, compile status and messages, and the user's uncompiled changes |
+| `edit_faust_fx` | Replaces a Faust effect's code; refused if the code changed since it was read or the user is editing it |
 
 A `reaper` skill tells Claude how to use them: inspect first, measure before and after, and edit
 only what you asked for. It includes `scripts/analyze.py`, which Claude runs on captured WAVs:
@@ -40,6 +43,15 @@ only what you asked for. It includes `scripts/analyze.py`, which Claude runs on 
 
 The analysis runs outside the MCP server (`uv run --script`, which installs numpy, soundfile and
 Pillow for the script on first use), so the server itself stays small.
+
+## Faust effects
+
+When no installed plugin does something simply (a ducker keyed by the drums, a utility, a custom filter),
+Claude can write the effect in [Faust](https://faustdoc.grame.fr). It runs in the **Faust (AutoReaper)** CLAP
+plugin from [`plugin/`](plugin/README.md), which keeps the code as its own state: the project stores it like any
+plugin's settings, Undo restores earlier code, and the project plays on another computer that has the plugin.
+The plugin window is a code editor where you can read and change the code and click Compile; Faust's errors show
+on their lines. The plugin is built from source for now and tested on Linux (see its README).
 
 ## Requirements
 
