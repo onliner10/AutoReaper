@@ -758,8 +758,9 @@ async def add_faust_fx(
     channel: [midi:key 36 10]) on the frame it arrives (sidechain_send kind midi). Controls marked [host:beat]
     (quarter notes), [host:bpm], [host:playing], [host:bar], [host:num], [host:den] follow REAPER's transport, so
     floor(beat) changes on the frame where each quarter note starts. Write settings as constants in the code. If
-    the code does not compile nothing is added and Faust's messages are returned. One Undo step. Bypass, move or
-    remove it with edit_fx like any plugin."""
+    the code does not compile nothing is added and Faust's messages are returned. Look up language and library
+    details offline as the reaper skill's plugins.md describes, rather than guessing. One Undo step. Bypass, move
+    or remove it with edit_fx like any plugin."""
     try:
         result = await fx_write(ADD_FAUST_FX, f'Add Faust FX {name}', program=faust_program, track=track, name=name,
                                 code=code, position=position, bypassed=bypassed)

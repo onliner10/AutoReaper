@@ -52,7 +52,9 @@ plugin from [`plugin/`](plugin/README.md), which keeps the code as its own state
 plugin's settings, Undo restores earlier code, and the project plays on another computer that has the plugin.
 The plugin window is a code editor where you can read and change the code and click Compile; Faust's errors show
 on their lines. Effects can listen to a sidechain (audio on the plugin's Sidechain pins, or MIDI notes and CCs)
-and follow REAPER's transport (beat, tempo, bar) to react on every quarter note. The plugin is built from source for now and tested on Linux (see its README).
+and follow REAPER's transport (beat, tempo, bar) to react on every quarter note. Claude looks up Faust offline: the
+skill includes the Faust manual's language, MIDI and error pages ([`skills/reaper/faust`](skills/reaper/faust)),
+and the standard library documents itself in the `.lib` files that come with Faust. The plugin is built from source for now and tested on Linux (see its README).
 
 ## Requirements
 

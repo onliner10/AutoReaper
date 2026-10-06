@@ -85,6 +85,22 @@ project stores it. Use it for small, precise processing you can state in a few l
 track, a gain or filter utility, a gate, a custom envelope. Prefer the standard library (`import("stdfaust.lib");`:
 `an.amp_follower_ar`, `ba.db2linear`, `si.smoo`, `fi.lowpass`, `co.compressor_stereo`, ...).
 
+- **Look things up instead of guessing** (everything below is offline):
+  - The language (operators, `with`, `letrec`, iterations, UI elements and metadata): `faust/syntax.md` in this
+    skill's folder; MIDI metadata: `faust/midi.md`; what a compiler error means: `faust/errors.md`. Grep for the
+    topic and Read that section, not the whole file.
+  - The standard library: the `.lib` files the plugin compiles with document every function (usage, parameters,
+    units). They are in the first of: `AUTOREAPER_FAUST_LIBRARIES`, `faustlibraries` beside the plugin, the
+    folder `faust --dspdir` prints, `/usr/share/faust`, `/usr/local/share/faust`, `/opt/homebrew/share/faust`,
+    `C:\Program Files\Faust\share\faust`. Find candidates by topic, then read one function's documentation:
+
+    ```
+    grep -n '^//-*`(' <dir>/*.lib | grep -i follower        # e.g. `(an.)amp_follower_ar`
+    grep -n -A20 '`(an.)amp_follower_ar`' <dir>/*.lib        # its usage, parameters and code
+    ```
+
+  - For a general Faust primer and idiomatic examples, the user can install Julius O. Smith's Faust skill
+    (`/plugin marketplace add josmithiii/gists`, then `/plugin install faust@josmithiii-gists`).
 - Inputs are main L, R, then sidechain L, R; outputs L, R. A sidechain ducker:
 
   ```faust
