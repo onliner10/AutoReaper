@@ -1,7 +1,10 @@
 """Read a WAV header with the standard library (PCM, float and WAVE_FORMAT_EXTENSIBLE)."""
 from __future__ import annotations
 
+import array
+import math
 import struct
+import sys
 from pathlib import Path
 
 
@@ -41,3 +44,30 @@ def wav_info(path: Path) -> dict:
     frames = data_size // fmt['block_align']
     return {**fmt, 'frames': frames, 'duration_seconds': frames / fmt['sample_rate'],
             'sample_format': 'FLOAT' if fmt['format_tag'] == 3 else 'PCM' if fmt['format_tag'] == 1 else str(fmt['format_tag'])}
+
+
+def wav_peak_dbfs(path: Path, chunk_frames: int = 1 << 16):
+    """Sample peak in dBFS of a 32-bit float WAV (AutoReaper's captures), None for other formats."""
+    info = wav_info(path)
+    if info['sample_format'] != 'FLOAT' or info['bits'] != 32:
+        return None
+    with open(path, 'rb') as f:
+        f.seek(12)
+        while True:
+            chunk, size = struct.unpack('<4sI', f.read(8))
+            if chunk == b'data':
+                break
+            f.seek(size + (size & 1), 1)
+        remaining, peak = info['frames'] * info['block_align'], 0.0
+        while remaining > 0:
+            data = f.read(min(remaining, chunk_frames * info['block_align']))
+            if not data:
+                break
+            remaining -= len(data)
+            values = array.array('f')
+            values.frombytes(data[:len(data) - len(data) % 4])
+            if sys.byteorder != 'little':
+                values.byteswap()
+            if values:
+                peak = max(peak, max(values), -min(values))
+    return 20 * math.log10(peak) if peak > 0 else -math.inf

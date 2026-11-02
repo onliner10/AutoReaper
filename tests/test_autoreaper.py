@@ -10,7 +10,7 @@ import pytest
 import soundfile
 
 from autoreaper import bridge as bridge_module, server
-from autoreaper.wav import wav_info
+from autoreaper.wav import wav_info, wav_peak_dbfs
 
 # The skill's measuring script, run by uv on its own, imported here as a module.
 _spec = importlib.util.spec_from_file_location(
@@ -268,3 +268,33 @@ def test_faust_docs_reads_the_cache_without_network(tmp_path, monkeypatch, capsy
     monkeypatch.setattr('sys.argv', ['faust_docs.py', '--version', 'latest'])
     with pytest.raises(SystemExit):
         faust_docs.main()
+
+
+def test_wav_peak_dbfs_reads_float_captures(tmp_path):
+    x = sine(1000, 1.0, 0.25)
+    soundfile.write(str(tmp_path / 'f.wav'), np.stack([x, -x * 2], 1), SR, subtype='FLOAT')
+    assert wav_peak_dbfs(tmp_path / 'f.wav') == pytest.approx(-6.02, abs=0.01)
+    soundfile.write(str(tmp_path / 'p.wav'), np.stack([x, x], 1), SR, subtype='PCM_24')
+    assert wav_peak_dbfs(tmp_path / 'p.wav') is None
+
+
+def test_loudness_of_a_sine_matches_bs1770(tmp_path, capsys):
+    # A 997 Hz sine at -20 dBFS peak in both channels reads -20 LUFS (K-weighting is ~0 dB there).
+    x = sine(997, 40.0, 0.1)
+    path = tmp_path / 'tone.wav'
+    write_capture(path, np.stack([x, x], 1), 0.0, {str(b): (b - 1) * 2.0 for b in range(1, 21)})
+    assert audio.main([str(path), '--loudness']) == 0
+    lines = capsys.readouterr().out.splitlines()
+    loud = json.loads(lines[0])['loudness']
+    for key in ('integrated_lufs', 'max_short_term_lufs', 'loudest_30s_lufs', 'true_peak_dbtp'):
+        assert loud[key] == pytest.approx(-20.0, abs=0.1), key
+    assert lines[2].endswith('LUFS') and float(lines[3].split()[-1]) == pytest.approx(-20.0, abs=0.15)
+
+
+def test_loudness_gate_ignores_silence(tmp_path, capsys):
+    x = np.concatenate([sine(997, 10.0, 0.1), np.zeros(SR * 30)])
+    path = tmp_path / 'gap.wav'
+    soundfile.write(str(path), np.stack([x, x], 1), SR, subtype='FLOAT')
+    assert audio.main([str(path), '--loudness', '--no-table']) == 0
+    loud = json.loads(capsys.readouterr().out.splitlines()[0])['loudness']
+    assert loud['integrated_lufs'] == pytest.approx(-20.0, abs=0.1)

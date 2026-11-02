@@ -19,8 +19,8 @@ dependencies = [
 autoreaper = "autoreaper.__main__:main"
 
 [dependency-groups]
-# numpy, soundfile and Pillow are for the skill's analyze.py script, which uv runs on its own.
-dev = ["pytest>=8", "lupa>=2", "numpy>=1.26", "soundfile>=0.12", "Pillow>=10"]
+# numpy, soundfile, Pillow and scipy are for the skill's analyze.py script, which uv runs on its own.
+dev = ["pytest>=8", "lupa>=2", "numpy>=1.26", "soundfile>=0.12", "Pillow>=10", "scipy>=1.11"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/autoreaper"]

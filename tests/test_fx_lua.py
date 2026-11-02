@@ -174,7 +174,7 @@ def test_server_programs_compile():
     runtime = lua_module.LuaRuntime()
     compile_ = runtime.eval('function(src) local f, e = load(src) return e end')
     for body in (server.ADD_FX, server.FX_PARAMETERS, server.SET_FX_PARAMETERS, server.EDIT_FX, server.SIDECHAIN_SEND,
-                 server.RESOLVE_TRACKS):
+                 server.RESOLVE_TRACKS, server.RESOLVE_BYPASS):
         assert compile_(server.fx_program(body, track='Bass', fx=0)) is None
     for body in (server.ADD_FAUST_FX, server.READ_FAUST_FX, server.EDIT_FAUST_FX):
         assert compile_(server.faust_program(body, track='Lead', fx=0)) is None
@@ -285,3 +285,105 @@ def test_faust_effect_known_when_not_running(offline):
       }''')
     assert faust.is_faust(None, 1) and not faust.is_faust(None, 0)
     assert ('offline' if offline else 'not installed') in faust.not_running(None, 1)
+
+
+# Two tracks; widening the bus moves the key pins of the compressor already on it, as REAPER can.
+WIDENING = r'''
+local tracks = {{name = 'Kick', nchan = 2}, {name = 'Bus', nchan = 4}}
+local pins = {[0] = 1, [1] = 2, [2] = 4, [3] = 8}
+local sends = {}
+reaper = {
+  EnumProjects = function() return 'project', 'song.rpp' end,
+  CountTracks = function() return #tracks end,
+  GetTrack = function(_, i) return tracks[i + 1] end,
+  GetMasterTrack = function() return {} end,
+  GetTrackName = function(t) return true, t.name end,
+  GetTrackGUID = function(t) return '{' .. t.name .. '}' end,
+  GetTrackNumSends = function() return #sends end,
+  GetTrackSendInfo_Value = function(_, _, s, key) return sends[s + 1][key] or 0 end,
+  SetTrackSendInfo_Value = function(_, _, s, key, v) sends[s + 1][key] = v; return true end,
+  CreateTrackSend = function(_, dest) sends[#sends + 1] = {P_DESTTRACK = dest}; return #sends - 1 end,
+  GetMediaTrackInfo_Value = function(t, key) return key == 'I_NCHAN' and t.nchan or 0 end,
+  SetMediaTrackInfo_Value = function(t, key, v)
+    if key == 'I_NCHAN' then t.nchan = v; pins[2], pins[3] = 1 << 4, 1 << 5 end
+    return true
+  end,
+  TrackFX_GetCount = function(t) return t.name == 'Bus' and 1 or 0 end,
+  TrackFX_GetFXName = function() return true, 'VST3: Pro-C 3 (FabFilter)' end,
+  TrackFX_GetFXGUID = function() return '{FX}' end,
+  TrackFX_GetIOSize = function() return true, 4, 2 end,
+  TrackFX_GetNamedConfigParm = function() return true, '' end,
+  TrackFX_GetPinMappings = function(_, _, _, pin) return pins[pin], 0 end,
+}
+'''
+
+
+def test_sidechain_send_reports_other_plugins_whose_pins_moved():
+    runtime = lua_module.LuaRuntime(unpack_returned_tuples=True)
+    runtime.execute(WIDENING)
+    result = runtime.execute(server.fx_program(server.SIDECHAIN_SEND, source='Kick', target='Bus', kind='audio',
+                                               channels=7, midi_bus=1, fx=None))
+    moved = result['other_fx_pins_moved']
+    assert moved[1]['pins_before'] == '1 2 3 4' and moved[1]['pins_after'] == '1 2 5 6'
+    assert 'warning' in result and result['target_track_channels'] == 8
+
+
+# Two tracks on a 120 BPM 4/4 grid (2 s per bar): one with the user's automation, one without a lane.
+ENVELOPES = r'''
+local function env(points) return {points = points} end
+local tracks = {{name = 'Lead', env = env({{0, 1, 0, 0}, {10, 0.5, 0, 0}})}, {name = 'Pad'}}
+local ext = {}
+reaper = {
+  CountTracks = function() return #tracks end,
+  GetTrack = function(_, i) return tracks[i + 1] end,
+  GetTrackName = function(t) return true, t.name end,
+  GetTrackGUID = function(t) return '{' .. t.name .. '}' end,
+  TimeMap2_beatsToTime = function(_, _, measure) return measure * 2 end,
+  TimeMap2_timeToQN = function(_, t) return t * 2 end,
+  TimeMap2_QNToTime = function(_, qn) return qn / 2 end,
+  GetTrackEnvelopeByName = function(t) return t.env end,
+  GetTrackStateChunk = function() return true, '<TRACK\n>' end,
+  SetTrackStateChunk = function(t) t.env = env({}); t.env.points = {{0, 1, 0, 0}}; return true end,
+  genGuid = function() return '{E}' end,
+  GetEnvelopeScalingMode = function() return 0 end,
+  ScaleFromEnvelopeMode = function(_, v) return v end,
+  ScaleToEnvelopeMode = function(_, v) return v end,
+  GetExtState = function(s, k) return ext[s .. k] or '' end,
+  SetExtState = function(s, k, v) ext[s .. k] = v end,
+  CountEnvelopePoints = function(e) return #e.points end,
+  GetEnvelopePoint = function(e, i) local p = e.points[i + 1]; return true, p[1], p[2], p[3], p[4] end,
+  DeleteEnvelopePointRange = function(e) e.points = {} end,
+  InsertEnvelopePoint = function(e, t, v, shape, tension) e.points[#e.points + 1] = {t, v, shape, tension}; return true end,
+  Envelope_SortPoints = function(e) table.sort(e.points, function(a, b) return a[1] < b[1] end) end,
+  CountTrackEnvelopes = function(t) return t.env and 1 or 0 end,
+  GetTrackEnvelope = function(t) return t.env end,
+  GetEnvelopeName = function() return true, 'Volume' end,
+}
+function value_at(name, time)
+  for _, t in ipairs(tracks) do
+    if t.name == name then
+      for _, p in ipairs(t.env.points) do if math.abs(p[1] - time) < 1e-9 then return p[2] end end
+    end
+  end
+end
+'''
+
+
+def test_volume_offsets_keep_the_users_points_and_rerun_from_them():
+    from pathlib import Path
+    script = (Path(server.__file__).parents[2] / 'skills' / 'reaper' / 'scripts' / 'volume_offsets.lua')
+    runtime = lua_module.LuaRuntime(unpack_returned_tuples=True)
+    runtime.execute(ENVELOPES)
+    apply = runtime.execute(script.read_text(encoding='utf-8'))
+    spec = lambda db: runtime.eval('function(db) return {key = "t", groups = {{tracks = {"Lead", "Pad"}, '
+                                   'offsets = {{1, db}, {3, 0}}}}} end')(db)
+    report = apply(spec(-6.0))
+    assert 'new envelope' in report[2] and 'volume lanes 1' in report[1]
+    half = 10 ** (-6 / 20)
+    # Bar 1 starts at 0 s: the user's unity point now sits 6 dB lower; bar 3 (4 s) is back to the user's curve.
+    assert runtime.globals().value_at('Lead', 0) == pytest.approx(half)
+    assert runtime.globals().value_at('Lead', 4) == pytest.approx(1 - 0.5 * 4 / 10)
+    assert runtime.globals().value_at('Lead', 10) == pytest.approx(0.5)
+    apply(spec(-3.0))  # a re-run starts from the stored originals, not from the -6 dB result
+    assert runtime.globals().value_at('Lead', 0) == pytest.approx(10 ** (-3 / 20))
+    assert runtime.globals().value_at('Pad', 0) == pytest.approx(10 ** (-3 / 20))

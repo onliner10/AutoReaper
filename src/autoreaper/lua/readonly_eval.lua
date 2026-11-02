@@ -50,6 +50,7 @@ TimeMap_QNToTime TimeMap_timeToQN TimeMap_QNToTime_abs TimeMap_timeToQN_abs
 TimeMap_QNToMeasures GetItemStateChunk GetTrackStateChunk GetEnvelopeStateChunk
 GetMediaItemTake_Track TrackFX_GetInstrument GetTrackMIDINoteName GetTrackMIDINoteNameEx
 GetTrackUIVolPan GetTrackState GetTrackAutomationMode kbd_getTextFromCmd CF_GetCommandText
+GetAudioDeviceInfo get_config_var_string
 ]]
 -- These mixed APIs are read-only ONLY when their write flag is literally false.
 local mixed = {

@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["numpy>=1.26", "soundfile>=0.12", "Pillow>=10"]
+# dependencies = ["numpy>=1.26", "soundfile>=0.12", "Pillow>=10", "scipy>=1.11"]
 # ///
 """Measure a WAV from AutoReaper's capture: levels, per-bar band table, before/after differences
 and an optional spectrogram image.
@@ -11,7 +11,9 @@ Prints one JSON line (levels, bar grid source, files written), then text tables:
 - per-bar band energy (sub 20-60 Hz ... air 10-20 kHz, dBFS), total RMS, spectral centroid, side/mid;
 - with --compare: the same table for WAV minus BEFORE_WAV, bar by bar (positive = louder in WAV);
 - with --steps N: the same per position in the bar (N parts, e.g. 16 sixteenths), averaged over the bars;
-- with --bars A-B: only those bars.
+- with --bars A-B: only those bars;
+- with --loudness: integrated LUFS (BS.1770-4 gating), max momentary/short-term, the loudest
+  --window seconds, true peak (4x oversampled) and a per-bar LUFS column, also for --compare.
 The bar grid comes from the capture's .json sidecar (or --bar-grid). Levels are dBFS of the
 original float samples: a full-scale sine reads -3 dB RMS in the table and 0 dB on the spectrogram.
 """
@@ -197,7 +199,9 @@ def format_table(rows, unit='bar', note=''):
         bands = ' '.join(f"{row[name]:>{width}.1f}" for name, width in zip(
             ('sub', 'low', 'lowmid', 'mid', 'highmid', 'high', 'air'), (8, 9, 9, 8, 6, 7, 9)))
         lines.append(f"{str(row['bar']):<5} {bands} | {row['total']:>8.1f} {row['centroid_hz']:>8d} "
-                     f"{row['side_mid_db']:>5.1f}")
+                     f"{row['side_mid_db']:>5.1f}" + (f" {row['lufs']:>6.1f}" if 'lufs' in row else ''))
+    if rows and 'lufs' in rows[0]:
+        lines[1] += '   LUFS'
     return '\n'.join(lines)
 
 
@@ -420,6 +424,73 @@ def render_spectrogram(samples, sample_rate, path, *, title, bar_grid=None, wav_
 DIFF_COLUMNS = ('sub', 'low', 'lowmid', 'mid', 'highmid', 'high', 'air', 'total', 'side_mid_db')
 
 
+def k_weighting(sample_rate):
+    """BS.1770 K-weighting (high shelf + RLB high-pass) as second-order sections for any sample rate."""
+    def shelf():
+        g, q, fc = 3.999843853973347, 0.7071752369554196, 1681.974450955533
+        k, vh, vb = math.tan(math.pi * fc / sample_rate), 10 ** (g / 20), (10 ** (g / 20)) ** 0.4996667741545416
+        a0 = 1 + k / q + k * k
+        return [(vh + vb * k / q + k * k) / a0, 2 * (k * k - vh) / a0, (vh - vb * k / q + k * k) / a0,
+                1, 2 * (k * k - 1) / a0, (1 - k / q + k * k) / a0]
+
+    def highpass():
+        q, fc = 0.5003270373238773, 38.13547087602444
+        k = math.tan(math.pi * fc / sample_rate)
+        a0 = 1 + k / q + k * k
+        return [1, -2, 1, 1, 2 * (k * k - 1) / a0, (1 - k / q + k * k) / a0]
+    return np.array([shelf(), highpass()])
+
+
+def block_loudness(weighted, sample_rate, seconds, hop_seconds):
+    """LUFS of overlapping blocks of K-weighted audio (channel powers summed, L/R weight 1)."""
+    power = (weighted ** 2).sum(axis=1)
+    size, hop = int(round(seconds * sample_rate)), max(1, int(round(hop_seconds * sample_rate)))
+    if len(power) < size:
+        return np.array([])
+    cumulative = np.concatenate([[0.0], np.cumsum(power)])
+    starts = np.arange(0, len(power) - size + 1, hop)
+    mean = (cumulative[starts + size] - cumulative[starts]) / size
+    return -0.691 + 10 * np.log10(np.maximum(mean, 1e-20))
+
+
+def gated_lufs(blocks):
+    """BS.1770-4 integrated loudness from 400 ms block loudnesses: -70 LUFS absolute, -10 LU relative gate."""
+    kept = blocks[blocks > -70]
+    if not len(kept):
+        return None
+    relative = -0.691 + 10 * np.log10(np.mean(10 ** ((kept + 0.691) / 10))) - 10
+    kept = kept[kept > relative]
+    return float(-0.691 + 10 * np.log10(np.mean(10 ** ((kept + 0.691) / 10)))) if len(kept) else None
+
+
+def loudness(samples, sample_rate, window_seconds=30.0):
+    """Integrated LUFS, max momentary (400 ms) and short-term (3 s), loudest window, true peak (dBTP)."""
+    from scipy.signal import resample_poly, sosfilt
+    stereo = as_stereo(samples)
+    weighted = sosfilt(k_weighting(sample_rate), stereo, axis=0)
+    momentary = block_loudness(weighted, sample_rate, 0.4, 0.1)
+    short = block_loudness(weighted, sample_rate, 3.0, 0.1)
+    window = block_loudness(weighted, sample_rate, window_seconds, 1.0)
+    factor = 4 if sample_rate < 96000 else 2
+    true_peak = max(float(np.abs(resample_poly(stereo[:, c], factor, 1)).max()) for c in range(2))
+    rounded = lambda v: None if v is None or not len(np.atleast_1d(v)) else round(float(np.max(v)), 2)
+    integrated = gated_lufs(momentary) if len(momentary) else None  # 400 ms blocks, 75 % overlap
+    return {'integrated_lufs': None if integrated is None else round(integrated, 2),
+            'max_momentary_lufs': rounded(momentary), 'max_short_term_lufs': rounded(short),
+            f'loudest_{window_seconds:g}s_lufs': rounded(window),
+            'true_peak_dbtp': round(20 * math.log10(true_peak), 2) if true_peak > 0 else FLOOR_DB}, weighted
+
+
+def bar_lufs(weighted, sample_rate, bar_grid, wav_start_seconds):
+    """Ungated LUFS per bar of K-weighted audio, {bar: LUFS}."""
+    out = {}
+    for bar, a, b in bar_segments(bar_grid, wav_start_seconds, len(weighted) / sample_rate, sample_rate,
+                                  len(weighted)):
+        mean = (weighted[a:b] ** 2).sum(axis=1).mean() if b > a else 0.0
+        out[bar] = round(-0.691 + 10 * math.log10(mean), 1) if mean > 0 else FLOOR_DB
+    return out
+
+
 def load(wav, bar_grid=None, wav_start_seconds=None):
     """(samples, sample_rate, grid, wav_start_seconds, sidecar) of a WAV and its capture sidecar."""
     import soundfile
@@ -441,7 +512,8 @@ def difference_rows(after, before):
         if row['bar'] in earlier:
             old = earlier[row['bar']]
             rows.append({'bar': row['bar'], **{k: round(row[k] - old[k], 1) for k in DIFF_COLUMNS},
-                         'centroid_hz': row['centroid_hz'] - old['centroid_hz']})
+                         'centroid_hz': row['centroid_hz'] - old['centroid_hz'],
+                         **({'lufs': round(row['lufs'] - old['lufs'], 1)} if 'lufs' in row and 'lufs' in old else {})})
     return rows
 
 
@@ -453,7 +525,9 @@ def format_difference_table(rows, unit='bar'):
         bands = ' '.join(f"{row[name]:>+{width}.1f}" for name, width in zip(
             ('sub', 'low', 'lowmid', 'mid', 'highmid', 'high', 'air'), (8, 9, 9, 8, 6, 7, 9)))
         lines.append(f"{str(row['bar']):<5} {bands} | {row['total']:>+8.1f} {row['centroid_hz']:>+8d} "
-                     f"{row['side_mid_db']:>+5.1f}")
+                     f"{row['side_mid_db']:>+5.1f}" + (f" {row['lufs']:>+6.1f}" if 'lufs' in row else ''))
+    if rows and 'lufs' in rows[0]:
+        lines[1] += '   LUFS'
     return '\n'.join(lines)
 
 
@@ -479,6 +553,9 @@ def parse_args(argv):
     parser.add_argument('--steps', type=int, help='also a table per position in the bar (16 = sixteenths), '
                                                   'averaged over the bars; with --compare, its difference too')
     parser.add_argument('--bars', help='only these bars, inclusive: "57-64" or "57"')
+    parser.add_argument('--loudness', action='store_true',
+                        help='integrated/momentary/short-term LUFS, loudest window, true peak, per-bar LUFS')
+    parser.add_argument('--window', type=float, default=30.0, help='seconds of the loudest window (--loudness)')
     args = parser.parse_args(argv)
     if args.steps is not None and not 2 <= args.steps <= 64:
         parser.error('--steps must be in 2..64')
@@ -488,6 +565,8 @@ def parse_args(argv):
     if not args.panels or any(p not in ('full', 'lowband', 'side') for p in args.panels) \
             or len(set(args.panels)) != len(args.panels):
         parser.error('--panels takes a comma list of full, lowband, side')
+    if not 1 <= args.window <= 600:
+        parser.error('--window must be in 1..600 seconds')
     if not 20 <= args.dynamic_range_db <= 160:
         parser.error('--dynamic-range-db must be in 20..160')
     if args.top_dbfs is not None and not -120 <= args.top_dbfs <= 30:
@@ -510,6 +589,11 @@ def main(argv=None):
                ('sidecar' if sidecar.get('bar_grid') else 'none')}
     tables = []
     rows = bar_table(samples, sample_rate, grid, start) if grid else []
+    if args.loudness:
+        summary['loudness'], weighted = loudness(samples, sample_rate, args.window)
+        per_bar = bar_lufs(weighted, sample_rate, grid, start) if grid else {}
+        for row in rows:
+            row['lufs'] = per_bar.get(row['bar'], FLOOR_DB)
     if not args.no_table:
         tables.append(format_table(rows) if grid else '# no bar grid, so no per-bar table')
     steps = step_table(samples, sample_rate, grid, start, args.steps) if args.steps and grid else []
@@ -522,8 +606,17 @@ def main(argv=None):
         summary['compare'] = {'wav': str(Path(args.compare)), 'levels': levels(before)}
         summary['level_difference_db'] = {k: round(summary['levels'][k] - summary['compare']['levels'][k], 2)
                                           for k in ('peak_dbfs', 'rms_dbfs')}
+        before_rows = bar_table(before, before_rate, before_grid, before_start) if before_grid else []
+        if args.loudness:
+            summary['compare']['loudness'], before_weighted = loudness(before, before_rate, args.window)
+            summary['loudness_difference_db'] = {
+                k: round(v - summary['compare']['loudness'][k], 2) for k, v in summary['loudness'].items()
+                if v is not None and summary['compare']['loudness'].get(k) is not None}
+            before_bars = bar_lufs(before_weighted, before_rate, before_grid, before_start) if before_grid else {}
+            for row in before_rows:
+                row['lufs'] = before_bars.get(row['bar'], FLOOR_DB)
         if grid and before_grid:
-            diff = difference_rows(rows, bar_table(before, before_rate, before_grid, before_start))
+            diff = difference_rows(rows, before_rows)
             summary['compared_bars'] = len(diff)
         else:
             # Without a bar grid on both sides, compare the whole recordings.

@@ -27,7 +27,7 @@ It has two parts:
 | `set_fx_parameters` | Sets parameters by display value ("130 Hz", "-18 dB", "Spectral") and checks the readback |
 | `edit_fx` | Bypass, enable, offline, remove, move or show a plugin |
 | `sidechain_send` | Audio sidechain (send, track channels, plugin pins) or MIDI trigger send on a MIDI bus |
-| `capture` | Renders a bar or time range (full mix or tracks soloed by GUID or name) offline to a WAV |
+| `capture` | Renders a bar or time range (full mix or tracks soloed by GUID or name) offline to a WAV, optionally with chosen plugins bypassed for an A/B; warns about offline media and near-silent renders |
 | `install_faust_plugin` | Downloads the Faust plugin for your system from this repository's release and installs it for REAPER |
 | `add_faust_fx` | Adds an effect written in Faust (needs the Faust plugin below); nothing is added if it does not compile |
 | `read_faust_fx` | A Faust effect's code, version, compile status and messages, and the user's uncompiled changes |
@@ -41,8 +41,12 @@ only what you asked for. It includes `scripts/analyze.py`, which Claude runs on 
 - `--steps 16`: the same per sixteenth of the bar, averaged over bars, for groove and ducking
   (`--bars 57-64` limits any table to a range),
 - `--spectrogram`: a PNG with bar lines, for an overview. Conclusions come from the numbers.
+- `--loudness`: integrated LUFS, max momentary/short-term, the loudest 30 s, true peak and LUFS per bar.
 
-The analysis runs outside the MCP server (`uv run --script`, which installs numpy, soundfile and
+It also has `scripts/volume_offsets.lua`, which multiplies section gain offsets into each track's one
+Volume envelope while keeping your own automation points.
+
+The analysis runs outside the MCP server (`uv run --script`, which installs numpy, scipy, soundfile and
 Pillow for the script on first use), so the server itself stays small.
 
 ## Faust effects
@@ -130,7 +134,8 @@ terminate the running script or launch a new instance, choose **New instance**.
   is saved to `~/.autoreaper/backups` first; backups older than 3 days or beyond 128 MB in total
   are deleted.
 - `capture` stops playback if REAPER is playing (it never stops a recording), temporarily changes
-  render settings and mute/solo, and restores them afterwards. The project is not changed.
+  render settings, mute/solo and the bypass of the plugins you name, and restores them afterwards.
+  The project is not changed.
 - An edit is refused if a different project became active since Claude last read it.
 - A request that times out is never sent again automatically.
 

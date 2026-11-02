@@ -18,7 +18,7 @@ from . import faust_plugin
 from .bridge import (BRIDGE_SCRIPT_NAME, LUA, PROTOCOL, BridgeError, ReaperBridge, default_reaper_resource_path,
                      home_directory, install_bridge_script, lua_string)
 from .lua_calls import _referenced_reaper_apis
-from .wav import wav_info
+from .wav import wav_info, wav_peak_dbfs
 
 # Claude Code warns above ~25k tokens of tool output; larger results go to a
 # file that Read and Grep can page through.
@@ -616,6 +616,18 @@ send = send or reaper.CreateTrackSend(source, target)
 assert(send >= 0, 'REAPER could not create the send')
 local result = {source = source_name, target = target_name, kind = args.kind, send_index = send, reused_existing_send = reused}
 local pins_changed = false
+-- Widening a track can silently remap the pins of plugins already on it (a compressor's key landing on its
+-- main inputs); snapshot every plugin's pins so the change is reported, not discovered by ear.
+local function chain_pins()
+  local rows = {}
+  for i = 0, reaper.TrackFX_GetCount(target) - 1 do
+    local row = {}
+    for _, pin in ipairs(fx.pins(target, i)) do row[#row + 1] = table.concat(pin.channels, '+') end
+    rows[i + 1] = table.concat(row, ' ')
+  end
+  return rows
+end
+local chain_before = chain_pins()
 if args.kind == 'audio' then
   local needed = args.channels + 1
   if reaper.GetMediaTrackInfo_Value(target, 'I_NCHAN') < needed then
@@ -662,6 +674,19 @@ else
 end
 result.send_volume = reaper.GetTrackSendInfo_Value(source, 0, send, 'D_VOL')
 result.pins_changed = pins_changed
+local chain_after, moved = chain_pins(), {}
+local own = args.fx ~= nil and fx.find(target, args.fx) or nil
+for i, after in ipairs(chain_after) do
+  if i - 1 ~= own and chain_before[i] ~= after then
+    local _, name = reaper.TrackFX_GetFXName(target, i - 1, '')
+    moved[#moved + 1] = {fx = i - 1, name = name, pins_before = chain_before[i], pins_after = after}
+  end
+end
+if #moved > 0 then
+  result.other_fx_pins_moved = moved
+  result.warning = 'Pins of other plugins on the target changed with the channel count. Check them ' ..
+    '(fx_parameters / pin connector) and re-test any sidechain on this track.'
+end
 result.changed = send_before ~= send_state(send) or pins_changed
   or reaper.GetMediaTrackInfo_Value(target, 'I_NCHAN') ~= channels_before
 return result
@@ -684,7 +709,8 @@ async def sidechain_send(
     widens the target track if needed and, with fx, connects the plugin's sidechain input pins to them. midi:
     a MIDI-only send to a MIDI bus. A plugin's MIDI input bus cannot be set by script: if midi_bus > 1, ask the
     user to choose it in the plugin's pin connector (I/O > MIDI input > Bus N). Then switch the plugin's own
-    sidechain/trigger setting with set_fx_parameters. One Undo step, pin changes included."""
+    sidechain/trigger setting with set_fx_parameters. One Undo step, pin changes included. When widening the
+    target moves the pins of other plugins on it, they are listed in other_fx_pins_moved with a warning."""
     try:
         result = await fx_write(SIDECHAIN_SEND, f'Sidechain {kind} send', source=source, target=target, kind=kind,
                                 channels=channels, midi_bus=midi_bus, fx=fx)
@@ -930,8 +956,9 @@ async def bar_range(start_bar, end_bar):
     return result
 
 
-async def render(start_seconds, end_seconds, track_guids):
-    """Offline-render master to a 48 kHz float WAV; REAPER's render settings and mute/solo are restored."""
+async def render(start_seconds, end_seconds, track_guids, bypass=()):
+    """Offline-render master to a 48 kHz float WAV; REAPER's render settings, mute/solo and the bypassed
+    plugins are restored."""
     capture_id = uuid4().hex[:12]
     captures = home_directory() / 'captures'
     captures.mkdir(parents=True, exist_ok=True)
@@ -942,7 +969,10 @@ async def render(start_seconds, end_seconds, track_guids):
         'local output_dir=' + lua_string(str(workspace.resolve())), 'local pattern="mix"',
         f'local start_time={start_seconds!r}', f'local end_time={end_seconds!r}',
         'local isolate_guids={' + ','.join(lua_string(g) for g in track_guids) + '}',
-        'local exclude_guids={}', (LUA / 'render.lua').read_text(encoding='utf-8')])
+        'local exclude_guids={}',
+        'local bypass_fx={' + ','.join('{track=' + lua_string(b['track']) + ',fx=' + lua_string(b['fx']) + '}'
+                                       for b in bypass) + '}',
+        (LUA / 'render.lua').read_text(encoding='utf-8')])
     began = time.monotonic()
     receipt = await bridge.evaluate(code, project_id=before['project_id'], mutate=False, timeout=1800)
     if not receipt.get('ok'):
@@ -950,7 +980,8 @@ async def render(start_seconds, end_seconds, track_guids):
     after = bridge.status()
     if after.get('project_id') != before['project_id'] or after.get('session') != before.get('session'):
         raise BridgeError('The project or bridge changed during rendering; capture rejected.')
-    result = empty_lists(receipt['result'], 'targets', 'soloed_tracks', 'excluded_tracks', 'bar_grid')
+    result = empty_lists(receipt['result'], 'targets', 'soloed_tracks', 'excluded_tracks', 'bar_grid',
+                         'offline_sources', 'bypassed_fx')
     rendered = workspace / 'mix.wav'
     info = wav_info(rendered)
     if abs(info['duration_seconds'] - (end_seconds - start_seconds)) > max(.1, 2 / info['sample_rate']):
@@ -963,6 +994,36 @@ async def render(start_seconds, end_seconds, track_guids):
     return wav, info, {**result, 'project_id': before['project_id'], 'render_wall_seconds': round(time.monotonic() - began, 3)}
 
 
+RESOLVE_BYPASS = '''
+local rows = {}
+for i, ref in ipairs(args.refs) do
+  local track = fx.track(ref.track)
+  local index = fx.find(track, ref.fx)
+  rows[i] = {track = reaper.GetTrackGUID(track), fx = reaper.TrackFX_GetFXGUID(track, index)}
+end
+return {rows = rows}
+'''
+
+# A render this quiet with nothing soloed is almost always offline media, not the mix.
+SILENT_CAPTURE_DBFS = -60.0
+
+
+class BypassFx(BaseModel):
+    track: str = Field(description='Track GUID or exact name ("master" for the master track).')
+    fx: str | int = Field(description='Plugin index (0-based) or name/FX GUID on that track.')
+
+
+async def bypass_targets(refs):
+    """Track and FX GUIDs for the plugins to switch off during a capture."""
+    if not refs:
+        return []
+    result = await read_query(fx_program(RESOLVE_BYPASS, refs=[r.model_dump() for r in refs]), 'Resolve bypass FX')
+    if not result.get('ok'):
+        message = (result.get('error') or 'Could not resolve the plugins to bypass.').splitlines()[0]
+        raise ValueError(re.sub(r'^\[string "[^"]*"\]:\d+: ', '', message))
+    return result['rows']
+
+
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True,
                                       openWorldHint=False), structured_output=False)
 async def capture(
@@ -972,13 +1033,18 @@ async def capture(
         end_seconds: float | None = None,
         track_guids: Annotated[list[str] | None, Field(
             description='Solo these tracks (GUIDs or exact track names; through their sends and parents); '
-                        'omit for the full mix.')] = None) -> str:
+                        'omit for the full mix.')] = None,
+        bypass_fx: Annotated[list[BypassFx] | None, Field(
+            description='Plugins switched off for this render only, for an A/B against a normal capture of the '
+                        'same range (more reliable than REAPER\'s FX Delta for sidechained or random-modulated '
+                        'effects).')] = None) -> str:
     """Render a range of the project offline to a 48 kHz float WAV, for measuring what you cannot hear.
     Returns the WAV path, the bar -> seconds grid, tempo and meter; a .json sidecar next to the WAV keeps
     the grid. Measure it with the reaper skill's analyze.py script (levels, per-bar band table, before/after
     comparison, optional spectrogram). Requires REAPER's render speed set to Full-speed Offline once
-    (File > Render). Stops playback if playing; restores render settings, mute and solo; the project is
-    not changed."""
+    (File > Render). Stops playback if playing; restores render settings, mute, solo and bypassed plugins;
+    the project is not changed. Reports peak_dbfs and warns when the render is near-silent or audio sources
+    in the range are offline (they render as silence)."""
     try:
         mode, start, end = capture_range(start_bar, end_bar, start_seconds, end_seconds)
         refs = coerce_track_guids(track_guids)
@@ -987,6 +1053,7 @@ async def capture(
     try:
         try:
             guids = await track_guids_for(refs)
+            bypass = await bypass_targets(bypass_fx or [])
         except ValueError as error:
             return output({'ok': False, 'error': f'Bad arguments: {error}'}, 'capture')
         if mode == 'bars':
@@ -994,7 +1061,8 @@ async def capture(
             first, last = musical['start_seconds'], musical['end_seconds']
         else:
             first, last = start, end
-        wav, info, result = await render(first, last, guids)
+        wav, info, result = await render(first, last, guids, bypass)
+        peak = await asyncio.to_thread(wav_peak_dbfs, wav)
         grid = [row for row in result.get('bar_grid') or [] if isinstance(row, dict)]
         summary = {
             'ok': True, 'wav': str(wav), 'sidecar': str(wav.with_suffix('.json')),
@@ -1005,7 +1073,19 @@ async def capture(
             'scope': result.get('listening_scope'), 'capture_point': result.get('capture_point'),
             'isolated_tracks': result.get('targets') or [], 'state_restored': result.get('state_restored'),
             'stopped_playback': result.get('stopped_playback'), 'render_wall_seconds': result.get('render_wall_seconds'),
+            'peak_dbfs': None if peak is None else round(peak, 2),
         }
+        if result.get('bypassed_fx'):
+            summary['bypassed_fx'] = result['bypassed_fx']
+        offline = result.get('offline_sources') or []
+        if offline:
+            summary['offline_sources'] = offline[:20]
+            summary['warning'] = (f'{len(offline)} audio source(s) in this range are offline and rendered as silence. '
+                                  'Set media online (reaper_eval_write: reaper.Main_OnCommand(40101, 0)) and capture '
+                                  'again before measuring.')
+        elif peak is not None and peak < SILENT_CAPTURE_DBFS:
+            summary['warning'] = (f'The render peaks at {peak:.1f} dBFS: check muted tracks or offline media before '
+                                  'measuring.')
         if result.get('stopped_playback'):
             summary['playback_notice'] = 'REAPER was playing, so playback was stopped to render; it was not restarted.'
         sidecar = {**summary, 'wav_start_seconds': first, 'bar_grid': grid, 'project_id': result.get('project_id')}
