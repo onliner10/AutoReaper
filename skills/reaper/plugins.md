@@ -32,6 +32,13 @@ part of its name. Prefer GUIDs from `inspect_project` when names repeat.
    prediction and then searches by setting and reading back (the note says "found by setting and
    reading back"). A change it cannot reach fails and leaves that parameter as it was. `changed` is
    true when any parameter's value or display moved.
+   Many VST3 and CLAP plugins (Soundtoys, UADx, FabFilter CLAP, ...) take a host change only while they
+   process audio, which they do not while REAPER is stopped in the background (it closes the audio
+   device) or while the plugin is bypassed. `set_fx_parameters` handles that itself: it renders 50 ms
+   of the track offline so the change lands, then checks it ("applied once the plugin processed
+   audio"). Setting such parameters with `reaper_eval_write` instead leaves them queued and the
+   readback stale; do not work around a failure that way. A row still marked `pending` (REAPER was
+   playing, or the render could not run) applies on the next playback or capture.
 3. **Measure the effect** (`capture` + `analyze.py --compare`) on the same range before and after,
    ideally on the track solo and in the mix. When comparing plugins or settings, match levels first, or
    the louder one wins.

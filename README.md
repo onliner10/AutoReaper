@@ -19,7 +19,7 @@ It has two parts:
 | `inspect_project` | Tracks (GUIDs, volume, pan, mute/solo, folders), FX, items, markers, tempo; filter by track name or bars |
 | `inspect_signal_flow` | Folder tree, sends, sidechains, sources, master FX |
 | `search_installed_fx` | Installed plugin names, without loading any |
-| `reaper_eval` | Read-only ReaScript Lua in a sandbox (getters only) |
+| `reaper_eval` | ReaScript Lua for reading the project; reports it if the code changed something |
 | `reaper_eval_write` | ReaScript Lua that changes the project: one Undo step, project backed up first |
 | `read_receipt` | The result of a request that timed out, without running it again |
 | `add_fx` | Adds a plugin by name or words from it; lists candidates when several match |
@@ -126,8 +126,9 @@ terminate the running script or launch a new instance, choose **New instance**.
 
 ## Safety
 
-- `reaper_eval` runs in a restricted Lua environment with REAPER's getter functions and no
-  `io`, `os` or `load`. Anything else stops with `needs_write_access`.
+- `reaper_eval` is meant for reading, but it is full ReaScript with your user's rights, not a
+  sandbox. It makes no Undo point and no backup; if the code changed the project anyway, the
+  result says `changed: true`. Rely on Claude Code's permission prompts (or auto mode) for it.
 - `reaper_eval_write` is full ReaScript with your user's rights: it can do anything a REAPER
   script can, including reading and writing files. Claude Code asks before each call unless you
   allow the tool. Each call is one Undo step (Ctrl+Z), and a copy of the project file (no media)
@@ -183,7 +184,7 @@ uv run pytest
 ```
 
 The tests cover the analysis script, argument checks and the bridge protocol, including the
-real `bridge.lua` and read-only sandbox running in Lua 5.4 against a fake REAPER API (through
+real `bridge.lua` running in Lua 5.4 against a fake REAPER API (through
 `lupa`). To try a working copy in Claude Code without installing it:
 
 ```bash

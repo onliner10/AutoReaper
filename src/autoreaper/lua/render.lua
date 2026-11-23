@@ -1,6 +1,7 @@
 -- Variables supplied by the Python transaction: output_dir, pattern, start_time,
--- end_time, isolate_guids, bypass_fx ({track=GUID, fx=FX GUID}). Render master with all
--- routing and effects; the bypass_fx plugins are off for this render only.
+-- end_time, isolate_guids, fx_switches ({track=GUID, fx=FX GUID, enabled=bool}). Render
+-- master with all routing and effects; the fx_switches plugins are switched for this
+-- render only (off for an A/B, or on so a bypassed plugin applies queued changes).
 local p=reaper.EnumProjects(-1,'')
 local project_state_before=reaper.GetProjectStateChangeCount(p)
 -- Offline rendering needs a stopped transport. Playing or paused is stopped here
@@ -60,21 +61,24 @@ for i=0,reaper.CountMediaItems(p)-1 do
     end
   end
 end
-local bypassed={}
-for _,want in ipairs(bypass_fx) do
+local switched={}
+-- Plugins may sit on the master as well as on tracks.
+local fx_tracks={reaper.GetMasterTrack(p)}
+for _,s in ipairs(track_state) do fx_tracks[#fx_tracks+1]=s.track end
+for _,want in ipairs(fx_switches) do
   local found=false
-  for _,s in ipairs(track_state) do
-    if guid_key(reaper.GetTrackGUID(s.track))==guid_key(want.track) then
-      for f=0,reaper.TrackFX_GetCount(s.track)-1 do
-        if guid_key(reaper.TrackFX_GetFXGUID(s.track,f))==guid_key(want.fx) then
-          local _,name=reaper.TrackFX_GetFXName(s.track,f,'')
-          bypassed[#bypassed+1]={track=s.track,index=f,enabled=reaper.TrackFX_GetEnabled(s.track,f),name=name}
+  for _,t in ipairs(fx_tracks) do
+    if guid_key(reaper.GetTrackGUID(t))==guid_key(want.track) then
+      for f=0,reaper.TrackFX_GetCount(t)-1 do
+        if guid_key(reaper.TrackFX_GetFXGUID(t,f))==guid_key(want.fx) then
+          local _,name=reaper.TrackFX_GetFXName(t,f,'')
+          switched[#switched+1]={track=t,index=f,enabled=reaper.TrackFX_GetEnabled(t,f),name=name,want=want.enabled}
           found=true
         end
       end
     end
   end
-  assert(found,'A plugin to bypass is no longer present')
+  assert(found,'A plugin to switch for the render is no longer present')
 end
 local function restore()
   for k,v in pairs(old_n) do reaper.GetSetProjectInfo(p,k,v,true) end
@@ -83,7 +87,7 @@ local function restore()
     reaper.SetMediaTrackInfo_Value(s.track,'B_MUTE',s.mute)
     reaper.SetMediaTrackInfo_Value(s.track,'I_SOLO',s.solo)
   end
-  for _,b in ipairs(bypassed) do reaper.TrackFX_SetEnabled(b.track,b.index,b.enabled) end
+  for _,b in ipairs(switched) do reaper.TrackFX_SetEnabled(b.track,b.index,b.enabled) end
 end
 local ok,err=xpcall(function()
   for k,v in pairs(numeric) do reaper.GetSetProjectInfo(p,k,v,true) end
@@ -103,14 +107,14 @@ local ok,err=xpcall(function()
   for _,s in ipairs(track_state) do
     if excluded[guid_key(reaper.GetTrackGUID(s.track))] then reaper.SetMediaTrackInfo_Value(s.track,'B_MUTE',1) end
   end
-  for _,b in ipairs(bypassed) do reaper.TrackFX_SetEnabled(b.track,b.index,false) end
+  for _,b in ipairs(switched) do reaper.TrackFX_SetEnabled(b.track,b.index,b.want) end
   reaper.Main_OnCommand(42230,0)
 end,debug.traceback)
 restore()
 local restored=true
 for k,v in pairs(old_n) do if reaper.GetSetProjectInfo(p,k,0,false)~=v then restored=false end end
 for k,v in pairs(old_s) do local _,now=reaper.GetSetProjectInfo_String(p,k,'',false); if now~=v then restored=false end end
-for _,b in ipairs(bypassed) do if reaper.TrackFX_GetEnabled(b.track,b.index)~=b.enabled then restored=false end end
+for _,b in ipairs(switched) do if reaper.TrackFX_GetEnabled(b.track,b.index)~=b.enabled then restored=false end end
 for _,s in ipairs(track_state) do
   if reaper.GetMediaTrackInfo_Value(s.track,'B_MUTE')~=s.mute or reaper.GetMediaTrackInfo_Value(s.track,'I_SOLO')~=s.solo then restored=false end
 end
@@ -129,5 +133,5 @@ return {state_restored=restored,stopped_playback=stopped_playback,render_mode='f
  project_state_change_count_after=reaper.GetProjectStateChangeCount(p),
  bar_grid_complete=#bar_grid>0 and bar_grid[#bar_grid].end_seconds>=end_time,
  targets=targets,excluded_tracks=exclude_guids,offline_sources=offline,
- bypassed_fx=(function() local r={} for _,b in ipairs(bypassed) do r[#r+1]=b.name end return r end)(),bar_grid=bar_grid,soloed_tracks=#isolate_guids==0 and solos or isolate_guids,
+ bypassed_fx=(function() local r={} for _,b in ipairs(switched) do if not b.want then r[#r+1]=b.name end end return r end)(),bar_grid=bar_grid,soloed_tracks=#isolate_guids==0 and solos or isolate_guids,
  listening_scope=#isolate_guids>0 and 'isolated tracks through master, sends and parent routing' or (#solos>0 and 'existing solo configuration through master' or 'current master mix')}

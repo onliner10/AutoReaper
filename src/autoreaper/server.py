@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import math
 import os
@@ -42,8 +43,8 @@ _TRACK_GUID = re.compile(r'^\{?[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9
 
 INSTRUCTIONS = """Tools for the user's open REAPER project, through the AutoReaper Bridge script running in REAPER.
 Start with reaper_status (if the bridge is missing, guide the user through install_bridge), then
-inspect_project. Read with reaper_eval (read-only Lua sandbox); change the project only when the user
-asked, with reaper_eval_write. You cannot hear: capture renders a range to WAV; measure it with the
+inspect_project. Read with reaper_eval; change the project only when the user asked, with
+reaper_eval_write (one Undo step, project backed up). You cannot hear: capture renders a range to WAV; measure it with the
 reaper skill's analyze.py script. Measure before and after any change you claim helped."""
 
 mcp = FastMCP('autoreaper', instructions=INSTRUCTIONS, log_level='WARNING')
@@ -142,11 +143,6 @@ async def track_guids_for(refs):
         message = (result.get('error') or 'Could not resolve the track names.').splitlines()[0]
         raise ValueError(re.sub(r'^\[string "[^"]*"\]:\d+: ', '', message))
     return result['guids']
-
-
-def readonly_program(code):
-    source = (LUA / 'readonly_eval.lua').read_text(encoding='utf-8')
-    return 'local run=(function()\n' + source + '\nend)()\nreturn run(' + lua_string(code) + ')'
 
 
 def api_preflight_code(names):
@@ -361,32 +357,28 @@ async def search_installed_fx(
         return output({'ok': False, 'error': str(error)}, 'installed_fx')
 
 
-@mcp.tool(annotations=READ, structured_output=False)
+EVAL = ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=False)
+
+
+@mcp.tool(annotations=EVAL, structured_output=False)
 async def reaper_eval(
         code: Annotated[str, Field(description='Lua chunk; `return` a JSON-compatible value.')]) -> str:
-    """Run read-only ReaScript Lua and return its value. The sandbox exposes REAPER's getter API
-    (tracks, items, takes, MIDI, FX parameters, envelopes, tempo map, markers, state chunks) plus
-    math/string/table/utf8; no io/os/load. Return names, GUIDs and numbers, never MediaTrack/pointer
-    values. Calling a setter or anything outside the sandbox stops with outcome needs_write_access:
-    use reaper_eval_write for edits the user asked for."""
+    """Run ReaScript Lua to read the project and return its value: tracks, items, takes, MIDI, FX
+    parameters, envelopes, tempo map, markers, state chunks. Return names, GUIDs and numbers, never
+    MediaTrack/pointer values. For reading only: there is no Undo point and no backup, so edits belong
+    in reaper_eval_write. If the code changed the project anyway, the result says so (changed: true)."""
     try:
-        receipt = await bridge.evaluate(readonly_program(code), mutate=False, label='AutoReaper read-only eval')
+        receipt = await bridge.evaluate(code, mutate=False, label='AutoReaper eval')
     except Exception as error:
         return output({'ok': False, 'changed': False, 'error': str(error)}, 'reaper_eval')
     if not receipt.get('ok'):
         return output(receipt, 'reaper_eval')
-    result = receipt.get('result') or {}
-    if result.get('status') == 'needs_review':
-        blocked = result.get('blocked') or 'a function'
-        return output({'ok': False, 'outcome': 'needs_write_access', 'changed': False, 'blocked': blocked,
-                       'error': f'The code calls {blocked}, which is outside the read-only sandbox. If it only '
-                                'reads, rewrite the read without it; if the user asked for this change, run it '
-                                'with reaper_eval_write.'}, 'reaper_eval')
-    if result.get('status') == 'complete':
-        return output({'ok': True, 'outcome': 'read_only', 'changed': False,
-                       'project_id': receipt.get('project_id'), 'result': result.get('value')}, 'reaper_eval')
-    return output({'ok': False, 'changed': False, 'outcome': 'not_dispatched',
-                   'error': result.get('error', 'Invalid read-only receipt.')}, 'reaper_eval')
+    result = {'ok': True, 'changed': bool(receipt.get('changed')), 'project_id': receipt.get('project_id'),
+              'result': receipt.get('result')}
+    if result['changed']:
+        result['warning'] = ('This code changed the project, with no Undo point and no backup. Tell the user '
+                             'what changed; make edits with reaper_eval_write.')
+    return output(result, 'reaper_eval')
 
 
 @mcp.tool(annotations=READ, structured_output=False)
@@ -408,7 +400,9 @@ async def reaper_eval_write(
                                                'readback of what changed.')],
         project_id: Annotated[str, Field(description='project_id from a fresh inspect_project or reaper_eval; '
                                                      'the edit is refused if another project is active.')],
-        label: Annotated[str, Field(description='Undo history label.', max_length=120)] = 'AutoReaper edit') -> str:
+        label: Annotated[str, Field(description='Undo history label (cut to 120 characters).')] = 'AutoReaper edit',
+        timeout_seconds: Annotated[int, Field(ge=1, le=1800, description='Seconds the Lua may run (e.g. a loop of '
+                                                                         'renders); default 60.')] = 60) -> str:
     """Change the project with ReaScript Lua, only for edits the user asked for. The whole call is one
     Undo step (Ctrl+Z reverts it) and a copy of the project file is saved first. Direct reaper.X(...)
     calls are checked to exist before anything runs. Do not call defer, atexit, Undo_BeginBlock/EndBlock
@@ -430,7 +424,9 @@ async def reaper_eval_write(
         destination = backups / ('backup-' + time.strftime('%Y%m%d-%H%M%S') + '-' + uuid4().hex[:6] + '.rpp')
         # The backup runs as the preflight: before the change count is taken and
         # the Undo block opens, and a failed backup blocks the edit.
-        receipt = await bridge.evaluate(code, project_id=project_id, label=label, preflight=backup_code(destination))
+        label = label if len(label) <= 120 else label[:119] + '…'
+        receipt = await bridge.evaluate(code, project_id=project_id, label=label, preflight=backup_code(destination),
+                                        timeout=timeout_seconds)
         if destination.is_file():
             receipt['backup'] = {'path': str(destination), 'media_copied': False}
         if 'TrackFX_SetPinMappings' in apis and 'TrackFX_SetEnabled' not in apis:
@@ -598,17 +594,61 @@ for _, change in ipairs(args.changes) do
     row.name = name
     local _, before = reaper.TrackFX_GetFormattedParamValue(track, index, p, '')
     local before_value = reaper.TrackFX_GetParamNormalized(track, index, p)
-    local _, note, after = fx.set(track, index, p, change.value, change.normalized)
+    local set_value, note, after, pending = fx.set(track, index, p, change.value, change.normalized)
     row.before, row.after, row.note = before, after, note
-    local value = reaper.TrackFX_GetParamNormalized(track, index, p)
+    local value = pending and set_value or reaper.TrackFX_GetParamNormalized(track, index, p)
     row.value = math.floor(value * 1e6 + 0.5) / 1e6
-    if value ~= before_value or after ~= before then changed = true end
+    if pending then row.pending, row.original = true, before_value end
+    if pending or value ~= before_value or after ~= before then changed = true end
   end)
   if not ok then row.error = tostring(err); failed = failed + 1 end
   results[#results + 1] = row
 end
+-- Queued changes (see fx.set): let the plugin process 50 ms of audio here, so they land before this
+-- request's Undo point is taken, then check what it shows. While playing it applies them by itself.
+local queued = {}
+for _, row in ipairs(results) do if row.pending then queued[#queued + 1] = row end end
+local flush_error = nil
+if #queued > 0 and not flush_audio then flush_error = 'no render available'
+elseif #queued > 0 and reaper.GetPlayStateEx(0) ~= 0 then flush_error = 'REAPER is playing, paused or recording'
+elseif #queued > 0 then
+  local guid = reaper.GetTrackGUID(track)
+  local switches = reaper.TrackFX_GetEnabled(track, index) and {} or
+    {{track = guid, fx = reaper.TrackFX_GetFXGUID(track, index), enabled = true}}
+  -- The master cannot be soloed; the full mix runs its plugins as well.
+  local is_master = track == reaper.GetMasterTrack(0)
+  local ok, err = pcall(flush_audio, is_master and {} or {guid}, switches)
+  if not ok then flush_error = (tostring(err):match('^[^\\n]*'):gsub('^%[string "[^"]*"%]:%d+: ', '')) end
+end
+for _, row in ipairs(queued) do
+  if flush_error then
+    row.unverified = flush_error
+  else
+    row.pending = nil
+    local _, now = reaper.TrackFX_GetFormattedParamValue(track, index, row.param, '')
+    local value = reaper.TrackFX_GetParamNormalized(track, index, row.param)
+    if fx.same_display(now, row.after) or math.abs(value - row.value) <= 2e-6 then
+      row.after, row.note = now, (row.note or '') .. '; applied once the plugin processed audio'
+    elseif math.abs(value - row.original) <= 1e-9 then
+      -- Take the value back out of the queue, or it would land later after all.
+      reaper.TrackFX_SetParamNormalized(track, index, row.param, row.original)
+      row.after = now
+      row.error = 'The plugin did not apply the new value even while processing audio; set it in the plugin window.'
+      failed = failed + 1
+    else
+      row.error = 'The plugin shows ' .. now .. ' instead of ' .. tostring(row.after) .. '; left as it is.'
+      row.after = now
+      failed = failed + 1
+    end
+  end
+  row.original = nil
+end
 return {track = track_name, fx = fx.describe(track, index), results = results, failed = failed, changed = changed}
 '''
+
+PENDING_NOTE = ('queued: this plugin takes host changes only while it processes audio (REAPER closes its audio '
+                'device when stopped in the background, and bypassed plugins are not processed); it applies on '
+                'the next playback or capture')
 
 
 class FxChange(BaseModel):
@@ -628,10 +668,20 @@ async def set_fx_parameters(
     normalized numbers. Each change reports before/after as displayed; a value outside the range is set to
     the closest reachable one and says so. If the plugin's readback differs from its own formatting, the
     value is found again by setting and reading back; a change that cannot be reached fails and leaves the
-    parameter as it was. changed is true when any value moved. All changes are one Undo step."""
+    parameter as it was. Many VST3/CLAP plugins apply host changes only while they process audio (REAPER
+    stopped in the background, or the plugin bypassed): the server then renders 50 ms of the track offline
+    so the change lands, and checks it (the project is not changed). changed is true when any value moved.
+    All changes are one Undo step."""
     try:
         payload = [change.model_dump() for change in changes]
-        result = await fx_write(SET_FX_PARAMETERS, 'Set FX parameters', track=track, fx=fx, changes=payload)
+        with render_workspace() as workspace:
+            def program(body, **arguments):
+                return flush_audio_function(workspace) + '\n' + fx_program(body, **arguments)
+            result = await fx_write(SET_FX_PARAMETERS, 'Set FX parameters', program, track=track, fx=fx,
+                                    changes=payload)
+        for row in result.get('results') or []:
+            if row.get('pending'):
+                row['note'] = f"{row.get('note') or ''}; {PENDING_NOTE} (not verified: {row.pop('unverified')})"
         if result.get('ok') and result.get('failed'):
             result['ok'] = False
             result['error'] = f"{result['failed']} change(s) failed; the others were applied (see results)."
@@ -1027,11 +1077,19 @@ def capture_range(start_bar, end_bar, start_seconds, end_seconds):
 
 
 def summarize_grid(bar_grid):
-    """Compact bar -> start seconds map plus the tempo/meter values the grid contains."""
+    """Tempo/meter of the grid, plus how bars map to seconds: when the grid is steady, one bar length (bar n
+    starts at first_bar_start_seconds + (n - first_bar) * bar_seconds), else every bar's start. The sidecar
+    keeps the full grid either way."""
     tempos = sorted({round(row['tempo'], 3) for row in bar_grid if 'tempo' in row})
     meters = sorted({f"{row['numerator']}/{row['denominator']}" for row in bar_grid if 'numerator' in row})
-    return {'bars': {str(row['bar']): round(row['start_seconds'], 4) for row in bar_grid},
-            'tempo_bpm': tempos[0] if len(tempos) == 1 else tempos,
+    starts = [row['start_seconds'] for row in bar_grid]
+    lengths = [b - a for a, b in zip(starts, starts[1:])] or [row['end_seconds'] - row['start_seconds']
+                                                              for row in bar_grid[:1] if 'end_seconds' in row]
+    steady = len(tempos) <= 1 and len(meters) <= 1 and lengths and max(lengths) - min(lengths) < 1e-4
+    timing = ({'bar_seconds': round(lengths[0], 6), 'first_bar': bar_grid[0]['bar'],
+               'first_bar_start_seconds': round(starts[0], 4)} if steady else
+              {'bars': {str(row['bar']): round(row['start_seconds'], 4) for row in bar_grid}})
+    return {**timing, 'tempo_bpm': tempos[0] if len(tempos) == 1 else tempos,
             'meter': meters[0] if len(meters) == 1 else meters}
 
 
@@ -1044,40 +1102,63 @@ async def bar_range(start_bar, end_bar):
     return result
 
 
-async def render(start_seconds, end_seconds, track_guids, bypass=()):
-    """Offline-render master to a 48 kHz float WAV; REAPER's render settings, mute/solo and the bypassed
-    plugins are restored."""
-    capture_id = uuid4().hex[:12]
+@contextlib.contextmanager
+def render_workspace():
+    """A fresh folder for one REAPER render, removed afterwards (a file REAPER still holds is left for
+    prune_captures)."""
     captures = captures_directory()
     captures.mkdir(parents=True, exist_ok=True)
-    await asyncio.to_thread(prune_scratch)
-    workspace = captures / ('render-' + capture_id)
+    workspace = captures / ('render-' + uuid4().hex[:12])
     workspace.mkdir()
     try:
-        return await render_into(workspace, captures, capture_id, start_seconds, end_seconds, track_guids, bypass)
+        yield workspace
     finally:
-        if workspace.is_dir():
-            for leftover in workspace.iterdir():
-                try:
-                    leftover.unlink()
-                except OSError:
-                    pass  # REAPER may still hold it; prune_captures removes it later
+        for leftover in workspace.iterdir():
             try:
-                workspace.rmdir()
+                leftover.unlink()
             except OSError:
                 pass
+        try:
+            workspace.rmdir()
+        except OSError:
+            pass
 
 
-async def render_into(workspace, captures, capture_id, start_seconds, end_seconds, track_guids, bypass):
-    before = bridge.status()
-    code = '\n'.join([
-        'local output_dir=' + lua_string(str(workspace.resolve())), 'local pattern="mix"',
-        f'local start_time={start_seconds!r}', f'local end_time={end_seconds!r}',
-        'local isolate_guids={' + ','.join(lua_string(g) for g in track_guids) + '}',
-        'local exclude_guids={}',
-        'local bypass_fx={' + ','.join('{track=' + lua_string(b['track']) + ',fx=' + lua_string(b['fx']) + '}'
-                                       for b in bypass) + '}',
+def render_inputs(workspace, start_seconds, end_seconds):
+    return ['local output_dir=' + lua_string(str(workspace.resolve())), 'local pattern="mix"',
+            f'local start_time={start_seconds!r}', f'local end_time={end_seconds!r}', 'local exclude_guids={}']
+
+
+def render_code(workspace, start_seconds, end_seconds, track_guids, switches=()):
+    """render.lua with its inputs."""
+    return '\n'.join(render_inputs(workspace, start_seconds, end_seconds) + [
+        'local isolate_guids=' + lua_value(list(track_guids)),
+        'local fx_switches=' + lua_value([{'track': b['track'], 'fx': b['fx'], 'enabled': bool(b['enabled'])}
+                                          for b in switches]),
         (LUA / 'render.lua').read_text(encoding='utf-8')])
+
+
+def flush_audio_function(workspace):
+    """Lua `flush_audio(track_guids, fx_switches)`: 50 ms of those tracks rendered offline, so their plugins
+    run their audio callback once (and apply queued host changes); everything is restored, the WAV discarded
+    with the workspace."""
+    return '\n'.join(['local function flush_audio(isolate_guids, fx_switches)'] + render_inputs(workspace, 0.0, .05)
+                     + [(LUA / 'render.lua').read_text(encoding='utf-8'), 'end'])
+
+
+async def render(start_seconds, end_seconds, track_guids, switches=()):
+    """Offline-render master to a 48 kHz float WAV; REAPER's render settings, mute/solo and the plugins
+    switched for the render ({track, fx, enabled}) are restored."""
+    capture_id = uuid4().hex[:12]
+    await asyncio.to_thread(prune_scratch)
+    with render_workspace() as workspace:
+        return await render_into(workspace, captures_directory(), capture_id, start_seconds, end_seconds,
+                                 track_guids, switches)
+
+
+async def render_into(workspace, captures, capture_id, start_seconds, end_seconds, track_guids, switches):
+    before = bridge.status()
+    code = render_code(workspace, start_seconds, end_seconds, track_guids, switches)
     began = time.monotonic()
     receipt = await bridge.evaluate(code, project_id=before['project_id'], mutate=False, timeout=1800)
     if not receipt.get('ok'):
@@ -1101,7 +1182,7 @@ local rows = {}
 for i, ref in ipairs(args.refs) do
   local track = fx.track(ref.track)
   local index = fx.find(track, ref.fx)
-  rows[i] = {track = reaper.GetTrackGUID(track), fx = reaper.TrackFX_GetFXGUID(track, index)}
+  rows[i] = {track = reaper.GetTrackGUID(track), fx = reaper.TrackFX_GetFXGUID(track, index), enabled = false}
 end
 return {rows = rows}
 '''
@@ -1141,8 +1222,8 @@ async def capture(
                         'same range (more reliable than REAPER\'s FX Delta for sidechained or random-modulated '
                         'effects).')] = None) -> str:
     """Render a range of the project offline to a 48 kHz float WAV, for measuring what you cannot hear.
-    Returns the WAV path, the bar -> seconds grid, tempo and meter; a .json sidecar next to the WAV keeps
-    the grid. Measure it with the reaper skill's analyze.py script (levels, per-bar band table, before/after
+    Returns the WAV path, tempo, meter and the bar length (bar_seconds; a bar -> seconds map when the
+    tempo or meter changes in the range); a .json sidecar next to the WAV keeps the full grid. Measure it with the reaper skill's analyze.py script (levels, per-bar band table, before/after
     comparison, optional spectrogram). Requires REAPER's render speed set to Full-speed Offline once
     (File > Render). Stops playback if playing; restores render settings, mute, solo and bypassed plugins;
     the project is not changed. Reports peak_dbfs and warns when the render is near-silent or audio sources

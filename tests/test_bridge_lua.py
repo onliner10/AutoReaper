@@ -1,4 +1,4 @@
-"""Runs the real bridge.lua and read-only sandbox in Lua 5.4 against a fake REAPER API."""
+"""Runs the real bridge.lua in Lua 5.4 against a fake REAPER API."""
 import asyncio
 import json
 import os
@@ -82,16 +82,15 @@ def test_bridge_lua_runs_reads_edits_and_reports_errors(tmp_path):
         failed = asyncio.run(client.evaluate('error("boom")', mutate=False))
         assert not failed['ok'] and 'boom' in failed['error']
 
-        # Read-only sandbox: getters run, setters ask for write access.
-        sandbox = asyncio.run(client.evaluate(server.readonly_program('return reaper.CountTracks(0)'), mutate=False))
-        assert sandbox['result'] == {'status': 'complete', 'value': 3}
-        blocked = asyncio.run(client.evaluate(
-            server.readonly_program('reaper.SetMediaTrackInfo_Value(nil, "D_VOL", 1)'), mutate=False))
-        assert blocked['result'] == {'status': 'needs_review', 'blocked': 'reaper.SetMediaTrackInfo_Value'}
-        undo = asyncio.run(client.evaluate(server.readonly_program('return reaper.Undo_CanUndo2(0) == nil'), mutate=False))
-        assert undo['result'] == {'status': 'complete', 'value': True}
-        escape = asyncio.run(client.evaluate(server.readonly_program('return os.getenv("HOME")'), mutate=False))
-        assert escape['result']['status'] == 'needs_review'
+        # reaper_eval reads with full ReaScript and says when the code changed the project after all.
+        real_bridge, server.bridge = server.bridge, client
+        try:
+            read = json.loads(asyncio.run(server.reaper_eval('return reaper.CountTracks(0)')))
+            assert read == {'ok': True, 'changed': False, 'project_id': read['project_id'], 'result': 3}
+            wrote = json.loads(asyncio.run(server.reaper_eval('reaper.SetMediaTrackInfo_Value(nil, "D_VOL", 1)')))
+            assert wrote['ok'] and wrote['changed'] is True and 'no Undo point' in wrote['warning']
+        finally:
+            server.bridge = real_bridge
 
         # A garbage request is dropped instead of blocking every later one.
         (tmp_path / 'request.lua').write_text('return nil', encoding='utf-8')

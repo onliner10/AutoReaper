@@ -43,12 +43,17 @@ def test_track_guids():
 
 
 def test_summarize_grid_maps_bars_to_starts():
-    grid = [{'bar': 117, 'start_seconds': 210.909090909, 'end_seconds': 212.72, 'tempo': 132.0,
-             'numerator': 4, 'denominator': 4},
-            {'bar': 118, 'start_seconds': 212.72727, 'end_seconds': 214.5, 'tempo': 132.0,
-             'numerator': 4, 'denominator': 4}]
-    assert server.summarize_grid(grid) == {'bars': {'117': 210.9091, '118': 212.7273}, 'tempo_bpm': 132.0,
-                                           'meter': '4/4'}
+    bar = 60 / 132 * 4
+    steady = [{'bar': 117 + i, 'start_seconds': 210.909090909 + i * bar, 'end_seconds': 210.909090909 + (i + 1) * bar,
+               'tempo': 132.0, 'numerator': 4, 'denominator': 4} for i in range(3)]
+    # A steady grid is one bar length (the sidecar keeps every bar).
+    one = {'bar_seconds': 1.818182, 'first_bar': 117, 'first_bar_start_seconds': 210.9091, 'tempo_bpm': 132.0,
+           'meter': '4/4'}
+    assert server.summarize_grid(steady) == one and server.summarize_grid(steady[:1]) == one
+    changing = steady[:2] + [{**steady[2], 'tempo': 120.0}]
+    changing[2]['start_seconds'] += .1
+    assert server.summarize_grid(changing) == {
+        'bars': {'117': 210.9091, '118': 212.7273, '119': 214.6455}, 'tempo_bpm': [120.0, 132.0], 'meter': '4/4'}
 
 
 def test_output_moves_large_results_to_a_file(tmp_path, monkeypatch):
@@ -152,7 +157,9 @@ def test_server_lists_its_tools_with_read_only_hints():
                           'add_faust_fx', 'read_faust_fx', 'edit_faust_fx', 'install_faust_plugin'}
     read_only = {name for name, tool in tools.items() if tool.annotations and tool.annotations.readOnlyHint}
     assert read_only == {'reaper_status', 'inspect_project', 'inspect_signal_flow', 'search_installed_fx',
-                         'reaper_eval', 'read_receipt', 'fx_parameters', 'read_faust_fx'}
+                         'read_receipt', 'fx_parameters', 'read_faust_fx'}
+    # reaper_eval is full ReaScript (it reports changes rather than preventing them), so it is not read-only.
+    assert tools['reaper_eval'].annotations.destructiveHint is False
     assert tools['reaper_eval_write'].annotations.destructiveHint is True
 
 

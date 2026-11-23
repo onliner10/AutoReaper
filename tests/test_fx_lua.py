@@ -188,17 +188,113 @@ def test_set_does_not_probe_live_when_formatting_is_reliable(lua):
     assert lua.eval('sets') == 0
 
 
-def test_set_says_when_the_plugin_ignores_changes(lua):
-    # Seen with a CLAP plugin: sets return true and change nothing.
-    lua.execute("reaper.TrackFX_SetParamNormalized = function() return true end "
-                "reaper.Audio_IsRunning = function() return 0 end")
-    with pytest.raises(lua_module.LuaError, match='did not take new values.*audio engine is stopped'):
+# Like Soundtoys and FabFilter CLAP plugins in REAPER 7.86 while the audio device is closed or the plugin is
+# bypassed: a host change waits in the plugin's queue and lands (last one wins) on its next audio block.
+QUEUED = '''
+queue = {}
+local set = reaper.TrackFX_SetParamNormalized
+reaper.TrackFX_SetParamNormalized = function(t, f, p, v) queue[p] = v return true end
+function process() for p, v in pairs(queue) do set(nil, 0, p, v) end queue = {} end
+'''
+
+
+def test_set_reports_a_queued_change_as_pending(lua):
+    lua.execute(QUEUED)
+    value, note, after, pending = set_param(lua, 1, '-18 dB')
+    assert pending is True and after == '-18.0 dB'
+    assert lua.eval('reaper.TrackFX_GetFormattedParamValue(nil, 0, 1)')[1] == '+0.0 dB'  # not yet
+    lua.execute('process()')
+    assert lua.eval('reaper.TrackFX_GetFormattedParamValue(nil, 0, 1)')[1] == '-18.0 dB'
+
+
+def test_set_keeps_a_queued_normalized_value(lua):
+    lua.execute(QUEUED)
+    value, note, after, pending = set_param(lua, 1, 0.8, normalized=True)
+    assert pending is True and value == 0.8 and after == '+18.0 dB'
+
+
+def test_queued_change_without_reliable_formatting_is_refused_and_left(lua):
+    lua.execute(QUEUED + "reaper.TrackFX_FormatParamValueNormalized = function(t, f, p) "
+                "return reaper.TrackFX_GetFormattedParamValue(t, f, p) end")
+    with pytest.raises(lua_module.LuaError, match='only while it processes audio.*normalized'):
         set_param(lua, 1, '-18 dB')
-    lua.execute("reaper.TrackFX_FormatParamValueNormalized = function(t, f, p) "
-                "return reaper.TrackFX_GetFormattedParamValue(t, f, p) end "
-                "reaper.Audio_IsRunning = function() return 1 end")
-    with pytest.raises(lua_module.LuaError, match='did not take new values.*plugin window'):
-        set_param(lua, 1, '-18 dB')
+    lua.execute('process()')
+    assert lua.eval('reaper.TrackFX_GetParamNormalized(nil, 0, 1)') == 0.5
+
+
+def test_display_without_its_unit_matches_the_formatted_value(lua):
+    # Soundtoys: formatting says "30.0 %", the control shows "30.0".
+    same = lua.eval('fx.same_display')
+    assert same('30.0', '30.0 %') and same(' 110.44 Hz', '110.44 Hz') and same('-inf dB', '-inf')
+    assert not same('30.0', '30.1 %') and not same('12 dB/oct', '12 dB') and not same('Bell', 'Notch')
+    assert not same('30 %', '30 Hz') and not same(None, '30')
+    lua.execute("local old = reaper.TrackFX_GetFormattedParamValue "
+                "reaper.TrackFX_GetFormattedParamValue = function(t, f, p) "
+                "local ok, s = old(t, f, p) return ok, (s:gsub(' dB$', '')) end")
+    value, note, after = set_param(lua, 1, '-18 dB')[:3]
+    assert after == '-18.0' and 'reading back' not in note
+
+
+GAIN = [{'param': 'Gain', 'value': '-18 dB'}]
+# The server's flush_audio renders 50 ms of the track; here it just runs the plugin's queue.
+FLUSH = "flushed = nil function flush_audio(guids, switches) flushed = {guids = guids, switches = switches} process() end "
+
+
+def test_set_fx_parameters_applies_queued_changes_in_the_same_request(lua):
+    lua.execute(QUEUED + FLUSH + "reaper.GetPlayStateEx = function() return 0 end")
+    result = run_body(lua, server.SET_FX_PARAMETERS, track='Bass', fx=0, changes=GAIN)
+    row = result['results'][1]
+    assert result['failed'] == 0 and result['changed'] is True
+    assert row['after'] == '-18.0 dB' and 'applied once' in row['note'] and 'pending' not in row and 'original' not in row
+    assert lua.eval('flushed.guids[1]') == '{AAAA0000-0000-0000-0000-000000000001}' and lua.eval('#flushed.switches') == 0
+
+
+def test_a_bypassed_plugin_is_switched_on_for_the_flush_only(lua):
+    lua.execute(QUEUED + FLUSH + "reaper.GetPlayStateEx = function() return 0 end "
+                "reaper.TrackFX_GetEnabled = function() return false end")
+    assert run_body(lua, server.SET_FX_PARAMETERS, track='Bass', fx=0, changes=GAIN)['failed'] == 0
+    assert lua.eval('flushed.switches[1].enabled') is True
+    assert lua.eval('flushed.switches[1].fx') == '{BBBB0000-0000-0000-0000-000000000002}'
+
+
+def test_queued_changes_stay_queued_while_playing_or_when_the_flush_fails(lua):
+    lua.execute(QUEUED + FLUSH + "reaper.GetPlayStateEx = function() return 1 end")
+    row = run_body(lua, server.SET_FX_PARAMETERS, track='Bass', fx=0, changes=GAIN)['results'][1]
+    assert row['pending'] is True and row['unverified'] == 'REAPER is playing, paused or recording' and lua.eval('flushed') is None
+    lua.execute("queue = {} reaper.GetPlayStateEx = function() return 0 end "
+                "function flush_audio() error('[string \"x\"]:9: Choose Full-speed Offline once\\nstack', 0) end")
+    row = run_body(lua, server.SET_FX_PARAMETERS, track='Bass', fx=0, changes=GAIN)['results'][1]
+    assert row['pending'] is True and row['unverified'] == 'Choose Full-speed Offline once'
+
+
+def test_a_change_the_plugin_never_applies_fails_after_the_flush(lua):
+    lua.execute(QUEUED + FLUSH + "reaper.GetPlayStateEx = function() return 0 end process = function() queue = {} end")
+    result = run_body(lua, server.SET_FX_PARAMETERS, track='Bass', fx=0, changes=GAIN)
+    assert result['failed'] == 1 and 'did not apply' in result['results'][1]['error']
+    assert lua.eval('queue[1]') == 0.5  # the original is what lands later, not the failed value
+
+
+def test_queued_master_plugin_is_flushed_through_the_full_mix(lua):
+    lua.execute(QUEUED + FLUSH + "reaper.GetPlayStateEx = function() return 0 end "
+                "local master = {} reaper.GetMasterTrack = function() return master end")
+    assert run_body(lua, server.SET_FX_PARAMETERS, track='master', fx=0, changes=GAIN)['failed'] == 0
+    assert lua.eval('#flushed.guids') == 0  # the master cannot be soloed
+
+
+def test_words_around_the_number_must_match(lua):
+    same = lua.eval('fx.same_display')
+    assert not same('LP 12', 'HP 12') and not same('Band 1', 'Mode 1') and same('Band 1', 'band 1')
+
+
+def test_a_rounding_plugin_is_not_taken_for_a_queue(lua):
+    # Steps of 5 dB from +0 dB: "+2 dB" rounds back to +0 dB; the readback does move for other steps.
+    lua.execute("local old = reaper.TrackFX_SetParamNormalized "
+                "reaper.TrackFX_SetParamNormalized = function(t, f, p, v) "
+                "if p == 1 then v = math.floor(v * 12 + 0.5) / 12 end return old(t, f, p, v) end")
+    result = set_param(lua, 1, '+2 dB')  # value, note, after: no fourth "pending"
+    assert len(result) == 3 and result[2] in ('+0.0 dB', '+5.0 dB')
+    result = set_param(lua, 1, 0.52, normalized=True)
+    assert len(result) == 3 and result[2] == '+0.0 dB'
 
 
 def test_set_accepts_a_plugin_that_quantizes(lua):

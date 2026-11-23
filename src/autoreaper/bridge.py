@@ -126,8 +126,9 @@ class ReaperBridge:
                     response_path.unlink(missing_ok=True)
                     return receipt
                 time.sleep(.04)
-            raise BridgeError(f'Request {request_id} timed out; outcome unknown. Do not replay it. '
-                              f'read_receipt with request_id={request_id} shows the result once it finishes.')
+            raise BridgeError(f'Request {request_id} timed out after {timeout:g} s; outcome unknown. Do not replay '
+                              f'it. read_receipt with request_id={request_id} shows the result once it finishes; '
+                              'give long work (loops of renders) a larger timeout_seconds next time.')
 
     def reload(self, timeout=5.0):
         """Ask the running bridge to reload its script file; the new session's status, or None."""

@@ -254,18 +254,37 @@ function fx.resolve(track, index, param, target, normalized, probe)
   return best, note, expected
 end
 
--- Set a parameter to a display value (or a normalized one) and read it back.
--- If the plugin then shows something other than what its formatting promised,
--- or its formatting cannot reach the target at all, search again by setting
--- and reading back. Returns value, note, after; errors (with the parameter
--- restored) when the target cannot be reached either way.
+-- Whether two displayed values say the same thing. Plugins often format an
+-- unset value with its unit and display the current one without ("30.0 %"
+-- vs "30.0"), so numbers compare as numbers; a missing unit matches any.
+function fx.same_display(a, b)
+  if a == nil or b == nil then return false end
+  local x, y = a:gsub('^%s+', ''):gsub('%s+$', ''), b:gsub('^%s+', ''):gsub('%s+$', '')
+  if x == y then return true end
+  local qa, ua = fx.quantity(x)
+  local qb, ub = fx.quantity(y)
+  if not (qa and qb) or (ua ~= '' and ub ~= '' and ua ~= ub) then return false end
+  -- Words around the number must agree ("LP 12" is not "HP 12"); only a unit
+  -- after it may be missing on one side ("12 dB/oct" is not "12 dB").
+  local function parts(s)
+    s = s:lower():gsub(',', '.'):gsub('%s', ''):gsub('−', '-')
+    local before, after = s:match('^(.-)[-+]?%d*%.?%d+(.*)$')
+    if not before then before, after = s:match('^(.-)[-+]?inf(.*)$') end
+    return before or s, after or ''
+  end
+  local pa, ra = parts(x)
+  local pb, rb = parts(y)
+  if pa ~= pb or (ra ~= '' and rb ~= '' and ra ~= rb) then return false end
+  return math.abs(qa - qb) <= 1e-9 * math.max(1, math.abs(qa))
+end
+
 -- Whether formatting unset values matches what the plugin shows: it must
 -- format the current value as displayed, and not show one text everywhere.
 local function formatting_reliable(track, index, param, original)
   local now = shown(track, index, param)
-  if format_at(track, index, param, original) ~= now then return false end
+  if not fx.same_display(format_at(track, index, param, original), now) then return false end
   local low, high = format_at(track, index, param, 0), format_at(track, index, param, 1)
-  return not (low == now and high == now)
+  return not (fx.same_display(low, now) and fx.same_display(high, now))
 end
 
 -- Why a plugin may ignore host changes, for error messages.
@@ -277,33 +296,66 @@ function fx.audio_hint()
   return ' Some plugins ignore host changes to some parameters; ask the user to set it in the plugin window.'
 end
 
+-- Many VST3 and CLAP plugins take a host change only on their next audio
+-- block: while REAPER's audio device is closed (it closes when stopped and in
+-- the background, by default) or the plugin is bypassed, the change waits in
+-- the plugin's queue and the readback still shows the old value. The last
+-- value set wins once the plugin processes audio (verified with Soundtoys and
+-- FabFilter CLAP plugins in REAPER 7.86). A readback that stays put even for
+-- the far end of the range means such a queue (a plugin that rounds to steps
+-- moves there); the probe is queued too, so the caller sets its value again.
+local function queues_changes(track, index, param, original)
+  local far = original < 0.5 and 1 or 0
+  reaper.TrackFX_SetParamNormalized(track, index, param, far)
+  return math.abs(reaper.TrackFX_GetParamNormalized(track, index, param) - original) <= 1e-9
+end
+
+-- Set a parameter to a display value (or a normalized one) and read it back.
+-- If the plugin then shows something other than what its formatting promised,
+-- or its formatting cannot reach the target at all, search again by setting
+-- and reading back. Returns value, note, after, pending: pending is true when
+-- the plugin queued the change (see queues_changes), with after = what it
+-- should show once applied. Errors (with the parameter as it was) when the
+-- target cannot be reached.
 function fx.set(track, index, param, target, normalized)
   local original = reaper.TrackFX_GetParamNormalized(track, index, param)
   local reliable = normalized or formatting_reliable(track, index, param, original)
   local ok, value, note, expected = pcall(fx.resolve, track, index, param, target, normalized)
   if not ok and reliable then error(value, 0) end
-  local after
   if ok then
     reaper.TrackFX_SetParamNormalized(track, index, param, value)
-    after = shown(track, index, param)
-    if normalized or after == expected then return value, note, after end
+    local after = shown(track, index, param)
+    local moved = math.abs(reaper.TrackFX_GetParamNormalized(track, index, param) - original) > 1e-9
+    if normalized and (moved or math.abs(value - original) <= 1e-9) then return value, note, after end
+    if not normalized and fx.same_display(after, expected) then return value, note, after end
+    if not moved and queues_changes(track, index, param, original) then
+      reaper.TrackFX_SetParamNormalized(track, index, param, reliable and value or original)
+      -- Formatting is the only guide while the change waits, so it must be trustworthy.
+      if not reliable then
+        error('The plugin applies host changes only while it processes audio, and it does not format unset '
+          .. 'values reliably, so this target cannot be found. Pass a normalized value (0..1) instead; '
+          .. 'parameter left as it was.', 0)
+      end
+      return value, note, normalized and format_at(track, index, param, value) or expected, true
+    end
+    if normalized then  -- rounded to the step it was on: that is the raw value's place
+      reaper.TrackFX_SetParamNormalized(track, index, param, value)
+      return value, note, shown(track, index, param)
+    end
+  elseif queues_changes(track, index, param, original) then
+    reaper.TrackFX_SetParamNormalized(track, index, param, original)
+    error('The plugin applies host changes only while it processes audio, and it does not format unset values '
+      .. 'reliably, so this target cannot be found. Pass a normalized value (0..1) instead; parameter left as it was.', 0)
   end
   local live_ok, live_value, live_note, live_expected =
     pcall(fx.resolve, track, index, param, target, false, fx.live_probe(track, index, param))
   if not live_ok then
-    -- Searching found nothing: tell a plugin that ignores every change apart from an unreachable target.
-    local ignored = true
-    for _, probe_value in ipairs({0, 1}) do
-      reaper.TrackFX_SetParamNormalized(track, index, param, probe_value)
-      if math.abs(reaper.TrackFX_GetParamNormalized(track, index, param) - original) > 1e-9 then ignored = false end
-    end
     reaper.TrackFX_SetParamNormalized(track, index, param, original)
-    if ignored then error('The plugin did not take new values for this parameter.' .. fx.audio_hint(), 0) end
     error(live_value, 0)
   end
   reaper.TrackFX_SetParamNormalized(track, index, param, live_value)
-  after = shown(track, index, param)
-  if live_expected and after ~= live_expected then
+  local after = shown(track, index, param)
+  if live_expected and not fx.same_display(after, live_expected) then
     reaper.TrackFX_SetParamNormalized(track, index, param, original)
     error('The plugin did not keep "' .. tostring(target) .. '" (it shows ' .. after .. '); parameter restored', 0)
   end

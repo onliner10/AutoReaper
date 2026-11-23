@@ -127,9 +127,9 @@ which runs inside REAPER and executes ReaScript sent by the server.
 
 ## When something fails
 
-- `needs_write_access` from `reaper_eval`: the code called something outside the read-only
-  sandbox; `blocked` names it. If it only reads, rewrite the read without that call; if it is an
-  edit the user asked for, use `reaper_eval_write`.
+- `changed: true` from `reaper_eval`: the code changed the project, with no Undo point. Tell the
+  user what changed, and make edits with `reaper_eval_write`. An item's start is `D_POSITION`
+  (`D_STARTPOS` does not exist and reads 0).
 - "not running" / "stale heartbeat": the bridge is not running; ask the user to run the action.
 - The `project_id` changes when the user saves under a new name: call `reaper_status` or
   `inspect_project` again rather than reusing the old id.
