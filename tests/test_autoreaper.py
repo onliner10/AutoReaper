@@ -59,6 +59,91 @@ def test_output_moves_large_results_to_a_file(tmp_path, monkeypatch):
     assert json.loads(open(summary['result_file'], encoding='utf-8').read())['big'].startswith('xxx')
 
 
+def test_prune_captures_by_age_size_and_stale_workspaces(tmp_path, monkeypatch):
+    import os
+    now = 1_000_000_000.0
+    day = 24 * 60 * 60
+
+    def capture(capture_id, age, size=10, extra=()):
+        paths = [tmp_path / f'capture-{capture_id}.wav', tmp_path / f'capture-{capture_id}.json',
+                 *(tmp_path / f'capture-{capture_id}-{name}.png' for name in extra)]
+        for path in paths:
+            path.write_bytes(b'x' * size)
+            os.utime(path, (now - age, now - age))
+        return paths
+
+    old = capture('a' * 12, 3 * day, extra=['full'])
+    fresh = capture('b' * 12, 60)
+    # An old WAV whose spectrogram was just made counts as recent.
+    analysed = capture('c' * 12, 3 * day)
+    os.utime(analysed[1], (now - 120, now - 120))
+    stale = tmp_path / 'render-111111111111'
+    stale.mkdir()
+    (stale / 'mix.wav').write_bytes(b'x')
+    os.utime(stale, (now - day, now - day))
+    running = tmp_path / 'render-222222222222'
+    running.mkdir()
+    os.utime(running, (now - 10, now - 10))
+    unrelated = tmp_path / 'notes.txt'
+    unrelated.write_text('keep')
+
+    server.prune_captures(tmp_path, now=now)
+    assert not any(p.exists() for p in old) and all(p.exists() for p in fresh + analysed)
+    assert not stale.exists() and running.is_dir() and unrelated.exists()
+
+    # Over the size cap recent captures are spared...
+    monkeypatch.setattr(server, 'MAX_CAPTURE_BYTES', 50)
+    newest = capture('d' * 12, 10, size=15)
+    server.prune_captures(tmp_path, now=now)
+    assert all(p.exists() for p in newest + fresh + analysed)
+    # ...and once they are older than that, the oldest go first.
+    monkeypatch.setattr(server, 'PROTECTED_CAPTURE_SECONDS', 0)
+    server.prune_captures(tmp_path, now=now)
+    assert all(p.exists() for p in newest + fresh) and not any(p.exists() for p in analysed)
+
+
+def test_prune_scratch_covers_temp_legacy_and_results(tmp_path, monkeypatch):
+    import os
+    home, captures = tmp_path / 'home', tmp_path / 'temp-captures'
+    monkeypatch.setenv('AUTOREAPER_HOME', str(home))
+    monkeypatch.setenv('AUTOREAPER_CAPTURES', str(captures))
+    assert server.captures_directory() == captures
+    old = time.time() - 3 * 24 * 3600
+    files = [captures / 'capture-aaaaaaaaaaaa.wav', home / 'captures' / 'capture-bbbbbbbbbbbb.wav',
+             home / 'results' / 'inspect-1.json']
+    for path in files:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b'x')
+        os.utime(path, (old, old))
+    server.prune_scratch()
+    assert not any(p.exists() for p in files)
+
+
+def test_captures_default_to_the_os_temp_folder(monkeypatch):
+    import tempfile
+    monkeypatch.delenv('AUTOREAPER_CAPTURES', raising=False)
+    if not server.sys.platform.startswith('linux'):
+        assert server.captures_directory() == Path(tempfile.gettempdir()) / 'autoreaper' / 'captures'
+
+
+def test_main_prunes_at_startup(monkeypatch):
+    pruned = threading.Event()
+    monkeypatch.setattr(server, 'prune_scratch', pruned.set)
+    monkeypatch.setattr(server.mcp, 'run', lambda: None)
+    server.main()
+    assert pruned.wait(5)
+
+
+def test_prune_results_by_age(tmp_path):
+    import os
+    old, new = tmp_path / 'inspect-1.json', tmp_path / 'inspect-2.json'
+    for path, age in ((old, 3 * 24 * 3600), (new, 60)):
+        path.write_text('{}')
+        os.utime(path, (1e9 - age, 1e9 - age))
+    server.prune_results(tmp_path, now=1e9)
+    assert not old.exists() and new.exists()
+
+
 def test_server_lists_its_tools_with_read_only_hints():
     tools = {tool.name: tool for tool in asyncio.run(server.mcp.list_tools())}
     assert set(tools) == {'reaper_status', 'install_bridge', 'inspect_project', 'inspect_signal_flow',

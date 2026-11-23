@@ -4,7 +4,11 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import os
 import re
+import sys
+import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import Annotated, Literal
@@ -26,6 +30,14 @@ MAX_INLINE_CHARS = 40000
 MAX_BACKUP_AGE_SECONDS = 3 * 24 * 60 * 60
 MAX_BACKUP_BYTES = 128 * 1024 * 1024
 MAX_CAPTURE_BARS = 512
+# Captures are scratch files for measuring: keep two days of them, at most 4 GiB, newest first.
+MAX_CAPTURE_AGE_SECONDS = 2 * 24 * 60 * 60
+MAX_CAPTURE_BYTES = 4 * 1024 ** 3
+# The size cap never takes captures this recent, so a long session keeps the "before" of its A/B.
+PROTECTED_CAPTURE_SECONDS = 6 * 60 * 60
+# A render workspace older than this belongs to a render that failed or was killed.
+STALE_WORKSPACE_SECONDS = 2 * 60 * 60
+_CAPTURE_FILE = re.compile(r'^capture-([0-9a-f]{12})(?:[.-]|$)')
 _TRACK_GUID = re.compile(r'^\{?[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}\}?$')
 
 INSTRUCTIONS = """Tools for the user's open REAPER project, through the AutoReaper Bridge script running in REAPER.
@@ -42,6 +54,30 @@ READ = ToolAnnotations(readOnlyHint=True, openWorldHint=False)
 
 def results_directory() -> Path:
     return home_directory() / 'results'
+
+
+def captures_directory() -> Path:
+    """AUTOREAPER_CAPTURES, else the OS temp folder, so the system's own cleanup can reach the renders
+    as well (macOS purges its temp folder by itself; Windows Storage Sense and Disk Cleanup clear it).
+    On Linux /var/tmp, since /tmp is often in RAM and these WAVs are large."""
+    explicit = os.environ.get('AUTOREAPER_CAPTURES')
+    if explicit:
+        return Path(explicit)
+    if sys.platform.startswith('linux'):
+        return Path('/var/tmp') / f'autoreaper-{os.getuid()}' / 'captures'
+    return Path(tempfile.gettempdir()) / 'autoreaper' / 'captures'
+
+
+def legacy_captures_directory() -> Path:
+    """Where earlier versions kept captures; still pruned so old renders do not stay forever."""
+    return home_directory() / 'captures'
+
+
+def prune_scratch():
+    """Age and size limits on captures and oversized results; safe to run at any time."""
+    for directory in dict.fromkeys((captures_directory(), legacy_captures_directory())):
+        prune_captures(directory)
+    prune_results(results_directory())
 
 
 def output(result, name):
@@ -151,6 +187,58 @@ def prune_backups(directory):
             path.unlink(missing_ok=True)
         else:
             total += stat.st_size
+
+
+def prune_captures(directory, now=None):
+    """Delete captures (WAV, .json sidecar, spectrogram PNGs) older than two days or beyond 4 GiB in
+    total, oldest first, plus render workspaces left by failed renders. A capture's age is its newest
+    file, so one still being analysed is kept; the size cap spares captures from the last six hours."""
+    if not directory.is_dir():
+        return
+    now = time.time() if now is None else now
+    groups = {}
+    for path in directory.iterdir():
+        try:
+            if path.is_dir():
+                if path.name.startswith('render-') and now - path.stat().st_mtime > STALE_WORKSPACE_SECONDS:
+                    for leftover in path.iterdir():
+                        leftover.unlink(missing_ok=True)
+                    path.rmdir()
+                continue
+            match = _CAPTURE_FILE.match(path.name)
+            if match:
+                stat = path.stat()
+                group = groups.setdefault(match.group(1), {'files': [], 'mtime': 0.0, 'size': 0})
+                group['files'].append(path)
+                group['mtime'] = max(group['mtime'], stat.st_mtime)
+                group['size'] += stat.st_size
+        except OSError:
+            continue  # in use (a WAV open elsewhere) or already gone: try again next time
+    total = 0
+    for group in sorted(groups.values(), key=lambda g: g['mtime'], reverse=True):
+        age = now - group['mtime']
+        over_size = total + group['size'] > MAX_CAPTURE_BYTES and age > PROTECTED_CAPTURE_SECONDS
+        if age > MAX_CAPTURE_AGE_SECONDS or over_size:
+            for path in group['files']:
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+        else:
+            total += group['size']
+
+
+def prune_results(directory, now=None):
+    """Delete oversized tool results older than two days."""
+    if not directory.is_dir():
+        return
+    cutoff = (time.time() if now is None else now) - MAX_CAPTURE_AGE_SECONDS
+    for path in directory.glob('*.json'):
+        try:
+            if path.stat().st_mtime < cutoff:
+                path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 async def read_query(code, label):
@@ -960,10 +1048,27 @@ async def render(start_seconds, end_seconds, track_guids, bypass=()):
     """Offline-render master to a 48 kHz float WAV; REAPER's render settings, mute/solo and the bypassed
     plugins are restored."""
     capture_id = uuid4().hex[:12]
-    captures = home_directory() / 'captures'
+    captures = captures_directory()
     captures.mkdir(parents=True, exist_ok=True)
+    await asyncio.to_thread(prune_scratch)
     workspace = captures / ('render-' + capture_id)
     workspace.mkdir()
+    try:
+        return await render_into(workspace, captures, capture_id, start_seconds, end_seconds, track_guids, bypass)
+    finally:
+        if workspace.is_dir():
+            for leftover in workspace.iterdir():
+                try:
+                    leftover.unlink()
+                except OSError:
+                    pass  # REAPER may still hold it; prune_captures removes it later
+            try:
+                workspace.rmdir()
+            except OSError:
+                pass
+
+
+async def render_into(workspace, captures, capture_id, start_seconds, end_seconds, track_guids, bypass):
     before = bridge.status()
     code = '\n'.join([
         'local output_dir=' + lua_string(str(workspace.resolve())), 'local pattern="mix"',
@@ -988,9 +1093,6 @@ async def render(start_seconds, end_seconds, track_guids, bypass=()):
         raise BridgeError('The rendered length differs from the requested range; check REAPER render settings.')
     wav = captures / f'capture-{capture_id}.wav'
     rendered.replace(wav)
-    for leftover in workspace.iterdir():
-        leftover.unlink()
-    workspace.rmdir()
     return wav, info, {**result, 'project_id': before['project_id'], 'render_wall_seconds': round(time.monotonic() - began, 3)}
 
 
@@ -1044,7 +1146,9 @@ async def capture(
     comparison, optional spectrogram). Requires REAPER's render speed set to Full-speed Offline once
     (File > Render). Stops playback if playing; restores render settings, mute, solo and bypassed plugins;
     the project is not changed. Reports peak_dbfs and warns when the render is near-silent or audio sources
-    in the range are offline (they render as silence)."""
+    in the range are offline (they render as silence). Captures are scratch files in the system temp
+    folder: those older than two days (or beyond 4 GiB, except the last six hours) are deleted
+    automatically; copy one with its .json elsewhere to keep it."""
     try:
         mode, start, end = capture_range(start_bar, end_bar, start_seconds, end_seconds)
         refs = coerce_track_guids(track_guids)
@@ -1097,4 +1201,7 @@ async def capture(
 
 
 def main():
+    # Every Claude Code session starts the server, so old renders go even in sessions that never
+    # capture. In the background: the first run after an upgrade may delete thousands of files.
+    threading.Thread(target=prune_scratch, name='autoreaper-prune', daemon=True).start()
     mcp.run()

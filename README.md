@@ -144,15 +144,24 @@ To stop Claude Code asking before the read-only tools, allow them in `/permissio
 
 ## Files
 
-Everything AutoReaper writes is under `~/.autoreaper` (`%USERPROFILE%\.autoreaper` on Windows):
+Renders go to the system temp folder, in `autoreaper/captures` (`%TEMP%\autoreaper\captures` on
+Windows, `$TMPDIR/autoreaper/captures` on macOS, `/var/tmp/autoreaper-<uid>/captures` on Linux):
+WAVs, their `.json` bar grids and spectrogram PNGs. They are scratch files. AutoReaper deletes those
+older than two days, and trims the folder to 4 GiB oldest first (sparing the last six hours), each time
+the server starts (every Claude Code session) and before every capture. The system's own temp cleanup
+reaches them too (macOS on its own; Windows Storage Sense and Disk Cleanup). Copy a WAV with its
+`.json` elsewhere to keep it. Set `AUTOREAPER_CAPTURES` to use another folder; REAPER must be able to
+write to it.
+
+Everything else is under `~/.autoreaper` (`%USERPROFILE%\.autoreaper` on Windows):
 
 | Folder | Contents |
 |---|---|
 | `bridge/` | Request and receipt files, heartbeat, `bridge-errors.log` |
-| `captures/` | Rendered WAVs, their `.json` bar grids and spectrogram PNGs |
 | `faust-docs/` | Faust manual pages per Faust version, downloaded once by the skill's `faust_docs.py` |
-| `backups/` | Project copies made before edits |
-| `results/` | Tool results too large to show inline |
+| `backups/` | Project copies made before edits; deleted after three days or beyond 128 MiB |
+| `results/` | Tool results too large to show inline; deleted after two days |
+| `captures/` | Renders from earlier versions; cleaned up by the same rules until empty |
 
 Set `AUTOREAPER_HOME` to move it. The bridge reads the same variable, so REAPER must see it too
 (set it as a user environment variable, then restart REAPER and Claude Code).

@@ -63,6 +63,11 @@ which runs inside REAPER and executes ReaScript sent by the server.
    `reaper.Main_OnCommand(40101, 0)` in `reaper_eval_write`) or the render is near-silent. Never
    analyse a capture that carries a warning.
 
+   Captures are scratch files in the system temp folder, deleted after two days (or beyond 4 GiB in
+   total, except those from the last six hours). A reference
+   capture meant to outlive that (a "before" for later sessions) must be copied out of the folder,
+   with its `.json` sidecar.
+
    The table gives, per bar, band energy in dBFS (sub 20-60, low 60-150, lowmid 150-500,
    mid 500-2k, highmid 2-5k, high 5-10k, air 10-20k), total RMS, spectral centroid and side/mid.
    `--compare` prints the per-bar difference in dB (positive = more in the first WAV).
