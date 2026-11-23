@@ -1,6 +1,7 @@
 import asyncio
 import importlib.util
 import json
+import sys
 import threading
 import time
 from pathlib import Path
@@ -154,7 +155,7 @@ def test_server_lists_its_tools_with_read_only_hints():
     assert set(tools) == {'reaper_status', 'install_bridge', 'inspect_project', 'inspect_signal_flow',
                           'search_installed_fx', 'reaper_eval', 'read_receipt', 'reaper_eval_write',
                           'capture', 'add_fx', 'fx_parameters', 'set_fx_parameters', 'edit_fx', 'sidechain_send',
-                          'add_faust_fx', 'read_faust_fx', 'edit_faust_fx', 'install_faust_plugin'}
+                          'add_faust_fx', 'read_faust_fx', 'edit_faust_fx', 'install_faust_plugin', 'compare_variants'}
     read_only = {name for name, tool in tools.items() if tool.annotations and tool.annotations.readOnlyHint}
     assert read_only == {'reaper_status', 'inspect_project', 'inspect_signal_flow', 'search_installed_fx',
                          'read_receipt', 'fx_parameters', 'read_faust_fx'}
@@ -390,3 +391,205 @@ def test_loudness_gate_ignores_silence(tmp_path, capsys):
     assert audio.main([str(path), '--loudness', '--no-table']) == 0
     loud = json.loads(capsys.readouterr().out.splitlines()[0])['loudness']
     assert loud['integrated_lufs'] == pytest.approx(-20.0, abs=0.1)
+
+
+def test_table_compares_labelled_files_with_the_baseline_and_its_noise_floor(tmp_path, capsys):
+    t = np.arange(SR * 4) / SR
+    tone = 0.1 * np.sin(2 * np.pi * 1000 * t)
+    files = {'base': tone, 'again': tone * 1.0001, 'louder': tone * 2, 'bassier': tone + 0.1 * np.sin(2 * np.pi * 100 * t)}
+    for name, x in files.items():
+        soundfile.write(str(tmp_path / f'{name}.wav'), np.stack([x, x], 1), SR, subtype='FLOAT')
+    args = ['table', *(f'{name}={tmp_path / name}.wav' for name in files), '--baseline', 'base', '--noise', 'again']
+    assert audio.main(args) == 0
+    result = json.loads(capsys.readouterr().out)
+    diff = {row['label']: row for row in result['vs_baseline']}
+    assert set(diff) == {'louder', 'bassier'} and [f['label'] for f in result['files']] == list(files)
+    assert diff['louder']['rms_dbfs'] == pytest.approx(6.02, abs=.05)
+    assert diff['louder']['integrated_lufs'] == pytest.approx(6.02, abs=.1)
+    assert diff['bassier']['bands']['low'] > 40 and abs(diff['bassier']['bands']['mid']) < .2
+    assert abs(result['noise_floor']['rms_dbfs']) < .01
+
+
+def test_table_rejects_bad_labels(tmp_path):
+    with pytest.raises(SystemExit):
+        audio.main(['table', 'nolabel.wav', '--baseline', 'x'])
+    with pytest.raises(SystemExit):
+        audio.main(['table', f'a={tmp_path}/a.wav', '--baseline', 'b'])
+
+
+class FakeSeries:
+    """compare_variants against fakes: records the order of renders and applies."""
+
+    def __init__(self, monkeypatch, fail_apply=None, fail_restore=False, analysis=({'ok': True, 'files': []}, None)):
+        self.log = []
+        self.fail_apply, self.fail_restore = fail_apply, fail_restore
+        self.silent, self.project = False, 'p'
+
+        async def guids(refs):
+            return ['{T}'] if refs else []
+
+        async def read_query(code, label):
+            return {'ok': True, 'originals': [{'track': '{T}', 'fx': '{F}', 'param': 1, 'value': .5, 'name': 'Gain',
+                                               'shown': '+0.0 dB', 'track_name': 'Bass', 'fx_name': 'Comp'}]}
+
+        async def render_variant(label, first, last, guids_, project_id=None, variant=None, workspace=None,
+                                 originals=None):
+            self.log.append(('render', label))
+            await server.same_project(project_id)
+            if variant is not None and label == self.fail_apply:
+                raise server.BridgeError('boom')
+            warnings = ['baseline peaks at -90.0 dBFS'] if label == 'baseline' and self.silent else []
+            applied = {'rows': [{'name': 'Gain', 'after': '-18.0 dB'}], 'failed': 0, 'unrestored': []} if variant else None
+            return f'C:/x/{label}.wav', {'targets': [{'track': 'Bass'}], 'warnings': warnings, 'peak_dbfs': -3.0,
+                                         'applied': applied, 'preroll_seconds': min(1.0, first)}
+
+        async def apply_variant(workspace, originals, variant, *, label=None, project_id=None):
+            name = variant.label if variant is not None else None
+            self.log.append(('keep' if label else 'apply', name))
+            if name is None and self.fail_restore:
+                raise server.BridgeError('The REAPER bridge is stopped or busy')
+            if name and name == self.fail_apply and not label:
+                raise server.BridgeError('boom')
+            return {'ok': True, 'rows': [{'name': 'Gain', 'after': '-18.0 dB'}] if name else [], 'failed': 0,
+                    'unrestored': [], 'undo': label}
+
+        async def run_analysis(files, baseline, noise):
+            self.log.append(('analyze', [label for label, _ in files], noise))
+            return analysis
+
+        for name, fake in (('track_guids_for', guids), ('read_query', read_query), ('render_variant', render_variant),
+                           ('apply_variant', apply_variant), ('run_analysis', run_analysis)):
+            monkeypatch.setattr(server, name, fake)
+        monkeypatch.setattr(server, 'prune_scratch', lambda: None)
+        monkeypatch.setattr(server.bridge, 'status', lambda: {'project_id': self.project})
+
+    def run(self, **kwargs):
+        variants = [server.Variant(label=label, set=[server.VariantChange(track='Bass', fx=0, param='Gain',
+                                                                          value='-18 dB')])
+                    for label in kwargs.pop('labels', ('a', 'b'))]
+        return json.loads(asyncio.run(server.compare_variants(variants, start_seconds=kwargs.pop('start', 2), end_seconds=6,
+                                                              track_guids=['Bass'], **kwargs)))
+
+
+def test_variants_render_baseline_each_variant_baseline_again_then_measure(monkeypatch):
+    series = FakeSeries(monkeypatch)
+    result = series.run()
+    # Each variant is applied, rendered and undone in one request; the restore after the series is a safety net.
+    assert series.log == [('render', 'baseline'), ('render', 'a'), ('render', 'b'),
+                          ('apply', None), ('render', 'baseline_end'),
+                          ('analyze', ['baseline', 'a', 'b', 'baseline_end'], 'baseline_end')]
+    assert result['ok'] and result['restored'] == {'ok': True} and 'analysis' in result
+    assert [f['label'] for f in result['files']] == ['baseline', 'a', 'b', 'baseline_end']
+
+
+def test_a_failure_mid_series_still_restores_and_returns_what_was_rendered(monkeypatch):
+    series = FakeSeries(monkeypatch, fail_apply='b')
+    result = series.run()
+    assert ('apply', None) in series.log and ('render', 'baseline_end') not in series.log
+    assert not result['ok'] and 'boom' in result['error'] and result['restored']['ok']
+    assert [f['label'] for f in result['files']] == ['baseline', 'a']
+
+
+def test_a_failed_restore_says_what_the_settings_were(monkeypatch):
+    series = FakeSeries(monkeypatch, fail_restore=True)
+    result = series.run(keep='a')
+    assert not result['ok'] and not result['restored']['ok'] and 'stopped or busy' in result['restored']['error']
+    assert result['restored']['originals'] == [{'track_name': 'Bass', 'fx_name': 'Comp', 'name': 'Gain',
+                                                'shown': '+0.0 dB', 'enabled': None}]
+    assert ('keep', 'a') not in series.log and ('render', 'baseline_end') not in series.log
+
+
+def test_keep_applies_the_variant_as_one_undo_step_after_the_series(monkeypatch):
+    series = FakeSeries(monkeypatch)
+    result = series.run(keep='b')
+    assert series.log.index(('keep', 'b')) > series.log.index(('render', 'baseline_end'))
+    assert result['ok'] and result['kept'] == {'label': 'b', 'ok': True, 'undo': 'Keep variant b'}
+
+
+def test_variants_without_analysis_still_return_the_wavs(monkeypatch):
+    series = FakeSeries(monkeypatch, analysis=(None, 'uv is not on PATH'))
+    result = series.run()
+    assert result['ok'] and result['analysis_error'] == 'uv is not on PATH' and len(result['files']) == 4
+
+
+def test_variant_arguments_are_checked_before_anything_runs(monkeypatch):
+    series = FakeSeries(monkeypatch)
+    assert 'unique' in series.run(labels=('a', 'a'))['error']
+    assert 'reserved' in series.run(labels=('baseline',))['error']
+    assert 'keep names no variant' in series.run(keep='z')['error']
+    long = json.loads(asyncio.run(server.compare_variants(
+        [server.Variant(label='a', fx=[server.VariantSwitch(track='Bass', fx=0, enabled=False)])],
+        start_seconds=0, end_seconds=60)))
+    assert 'exceed' in long['error'] and series.log == []
+
+
+def test_analysis_never_hangs_or_raises(monkeypatch, tmp_path):
+    files = [('baseline', 'a.wav')]
+    script = tmp_path / 'fake.py'
+
+    def command(code):
+        script.write_text(code, encoding='utf-8')
+        monkeypatch.setattr(server, 'analysis_command', lambda *_: ([sys.executable, str(script)], None))
+
+    command('import time; time.sleep(30)')
+    monkeypatch.setattr(server, 'ANALYSIS_TIMEOUT_SECONDS', 1)
+    assert 'was stopped' in asyncio.run(server.run_analysis(files, 'baseline', None))[1]
+    command('import sys; sys.stderr.write("Traceback" + chr(10) + "ValueError: bad wav" + chr(10)); sys.exit(3)')
+    assert 'exit 3' in asyncio.run(server.run_analysis(files, 'baseline', None))[1]
+    command('print("not json")')
+    assert 'did not print JSON' in asyncio.run(server.run_analysis(files, 'baseline', None))[1]
+    command('import json; print(json.dumps({"ok": True, "files": []}))')
+    assert asyncio.run(server.run_analysis(files, 'baseline', None)) == ({'ok': True, 'files': []}, None)
+    monkeypatch.setattr(server, 'analysis_command', lambda *_: (['C:/no/such/uv.exe'], None))
+    assert 'could not start' in asyncio.run(server.run_analysis(files, 'baseline', None))[1]
+
+
+def test_analysis_command_needs_uv_and_the_script(monkeypatch, tmp_path):
+    monkeypatch.setattr(server.shutil, 'which', lambda _: None)
+    assert 'uv is not on PATH' in server.analysis_command([], 'baseline', None)[1]
+    monkeypatch.setattr(server.shutil, 'which', lambda _: 'uv')
+    monkeypatch.setattr(server, 'ANALYZE_SCRIPT', tmp_path / 'missing.py')
+    assert 'not found' in server.analysis_command([], 'baseline', None)[1]
+
+
+def test_render_warnings_reach_the_result(monkeypatch):
+    series = FakeSeries(monkeypatch)
+    series.silent = True
+    assert series.run()['warnings'] == ['baseline peaks at -90.0 dBFS']
+    series.silent = False
+    assert 'pre-roll' in series.run(start=0.25)['warnings'][0]
+
+
+def test_a_project_switch_stops_the_series(monkeypatch):
+    series = FakeSeries(monkeypatch)
+    original = server.same_project
+
+    async def switch_after_first_variant(project_id):
+        if ('render', 'a') in series.log:
+            series.project = 'other'
+        return await original(project_id)
+    monkeypatch.setattr(server, 'same_project', switch_after_first_variant)
+    result = series.run()
+    assert not result['ok'] and 'Another project became active' in result['error']
+    # Stopped at the render that found another project; the original settings are still put back.
+    assert ('render', 'b') not in series.log and series.log[-1] == ('apply', None)
+    assert [f['label'] for f in result['files']] == ['baseline']
+
+
+def test_analysis_errors_of_any_kind_come_back_as_text(monkeypatch):
+    async def broken(*_):
+        raise RuntimeError('event loop closed')
+    monkeypatch.setattr(server, 'analysis_process', broken)
+    assert asyncio.run(server.run_analysis([], 'baseline', None)) == (None, 'analysis failed: RuntimeError: event loop closed')
+
+
+def test_wav_drop_head_cuts_the_pre_roll_exactly(tmp_path):
+    from autoreaper.wav import wav_drop_head
+    x = np.arange(SR * 3, dtype=np.float32) / (SR * 3)
+    path = tmp_path / 'r.wav'
+    soundfile.write(str(path), np.stack([x, -x], 1), SR, subtype='FLOAT')
+    info = wav_drop_head(path, SR)
+    y, rate = soundfile.read(str(path), dtype='float32', always_2d=True)
+    assert rate == SR and info['frames'] == SR * 2 and len(y) == SR * 2
+    assert y[0, 0] == x[SR] and y[-1, 1] == -x[-1]
+    assert wav_drop_head(path, 0)['frames'] == SR * 2

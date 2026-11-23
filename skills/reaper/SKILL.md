@@ -26,7 +26,7 @@ which runs inside REAPER and executes ReaScript sent by the server.
    markers; in a big project narrow it with `track_query`, `from_bar`/`to_bar` (items in that range)
    or `include_items: false` rather than parsing the result file. `inspect_signal_flow` gives folders,
    sends and sidechains. Indices are zero-based; prefer GUIDs, since indices shift when tracks move.
-2. **Read anything else with `reaper_eval`** (read-only Lua). Return plain data: names, GUIDs,
+2. **Read anything else with `reaper_eval`** (Lua for reading; it makes no Undo point). Return plain data: names, GUIDs,
    numbers, tables of those. Example, FX parameters of track 0, FX 0:
 
    ```lua
@@ -85,14 +85,24 @@ which runs inside REAPER and executes ReaScript sent by the server.
    For anything the script does not cover, write your own Python on the WAV
    (e.g. `uv run --with numpy --with soundfile`).
    Say what measurements cannot show: feel, groove and taste are the user's call.
-4. **Measure before and after.** When the user asks whether a change helped, capture the same
-   range with the same tracks before and after the edit, run `--compare`, and report the numbers.
+4. **Measure before and after with `compare_variants`.** For any plugin change you want to judge
+   (a parameter value, a plugin switched off, several settings side by side) give it the range, the
+   tracks and up to 8 `variants` (`set`: parameter changes by display value; `fx`: plugins on or
+   off). In one call it renders the range as it is, each variant from the original state, and the
+   original again, measures all of them with `analyze.py table`, and restores everything, also after
+   an error. `analysis.vs_baseline` gives each variant minus the original (levels, LUFS, bands);
+   `analysis.noise_floor` is the original against its second render: a difference not clearly larger
+   than that is not a real change (random reverbs and modulation can make it several dB in the
+   bands). A single before/after the user asked for is one variant with `keep` set to its label: it
+   stays in the project as one Undo step. Keep ranges to 2-4 bars while trying settings; each render
+   costs about 1-3 s plus a 1 s pre-roll that is cut off (start the range at least 1 s into the project
+   when you can). Afterwards the Undo history may show up to one entry per variant, "AutoReaper:
+   compare variants (no change)"; undoing them changes nothing. Tell the user when you leave several. Use the returned WAVs for anything the table does not show (`--steps`,
+   `--spectrogram`, `--compare`). For edits it does not cover (faders, sends, items, automation),
+   capture the same range before and after the edit and run `--compare`.
    Renders of the same unchanged range can differ by about 0.1 dB (and more for random or
-   time-based effects), so do not read meaning into differences that small.
-   To hear what one plugin does, capture the range twice: once normally and once with
-   `bypass_fx: [{track, fx}]` (the plugin is off for that render only, then restored). This is more
-   reliable than REAPER's FX "Delta" for sidechained, look-ahead or random-modulated plugins; for
-   random reverbs and delays compare band levels averaged over bars, not sample differences.
+   time-based effects), so do not read meaning into differences that small. For random reverbs and
+   delays compare band levels averaged over bars, not sample differences.
 5. **Plugins** (adding, reading and setting parameters, bypass, sidechains): use `add_fx`,
    `fx_parameters`, `set_fx_parameters`, `edit_fx` and `sidechain_send`, and read
    [plugins.md](plugins.md) in this skill's folder first. Set parameters by display value

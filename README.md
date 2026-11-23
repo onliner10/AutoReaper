@@ -26,6 +26,7 @@ It has two parts:
 | `fx_parameters` | A plugin's parameters as it displays them, with ranges, list options and input pins |
 | `set_fx_parameters` | Sets parameters by display value ("130 Hz", "-18 dB", "Spectral") and checks the readback |
 | `edit_fx` | Bypass, enable, offline, remove, move or show a plugin |
+| `compare_variants` | Renders a range as it is and with up to 8 plugin settings or bypasses, measures them against each other and against the noise floor, then restores the original or keeps one |
 | `sidechain_send` | Audio sidechain (send, track channels, plugin pins) or MIDI trigger send on a MIDI bus |
 | `capture` | Renders a bar or time range (full mix or tracks soloed by GUID or name) offline to a WAV, optionally with chosen plugins bypassed for an A/B; warns about offline media and near-silent renders |
 | `install_faust_plugin` | Downloads the Faust plugin for your system from this repository's release and installs it for REAPER |

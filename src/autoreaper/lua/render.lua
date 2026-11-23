@@ -24,6 +24,11 @@ local numeric={RENDER_SETTINGS=0,RENDER_BOUNDSFLAG=0,RENDER_STARTPOS=start_time,
 -- native render scale so measurements can observe samples above 0 dBFS; the
 -- Python delivery path creates a separate safe PCM audition copy.
 local strings={RENDER_FILE=output_dir,RENDER_PATTERN=pattern,RENDER_FORMAT='ZXZhdyAAAAA=',RENDER_FORMAT2=''}
+-- An existing target makes REAPER ask whether to overwrite it, a modal dialog that blocks the bridge
+-- until someone answers. Targets are scratch files: remove it, and refuse if that is not possible.
+local target=output_dir..package.config:sub(1,1)..pattern..'.wav'
+os.remove(target)
+assert(not reaper.file_exists(target),'The render target exists and cannot be replaced: '..target)
 local old_n,old_s,track_state={},{},{}
 for k in pairs(numeric) do old_n[k]=reaper.GetSetProjectInfo(p,k,0,false) end
 for k in pairs(strings) do local _,v=reaper.GetSetProjectInfo_String(p,k,'',false); old_s[k]=v end
@@ -61,6 +66,14 @@ for i=0,reaper.CountMediaItems(p)-1 do
     end
   end
 end
+-- Switch a plugin on or off without an Undo point: TrackFX_SetEnabled adds one even outside an
+-- Undo block (REAPER 7.86), so one Ctrl+Z would flip the plugin again. REAPER's own Bypass
+-- parameter of every FX (":bypass") does the same switch silently.
+local function switch_quietly(track,index,enabled)
+  local p=reaper.TrackFX_GetParamFromIdent and reaper.TrackFX_GetParamFromIdent(track,index,':bypass') or -1
+  if p and p>=0 then reaper.TrackFX_SetParamNormalized(track,index,p,enabled and 0 or 1)
+  else reaper.TrackFX_SetEnabled(track,index,enabled) end
+end
 local switched={}
 -- Plugins may sit on the master as well as on tracks.
 local fx_tracks={reaper.GetMasterTrack(p)}
@@ -87,7 +100,7 @@ local function restore()
     reaper.SetMediaTrackInfo_Value(s.track,'B_MUTE',s.mute)
     reaper.SetMediaTrackInfo_Value(s.track,'I_SOLO',s.solo)
   end
-  for _,b in ipairs(switched) do reaper.TrackFX_SetEnabled(b.track,b.index,b.enabled) end
+  for _,b in ipairs(switched) do switch_quietly(b.track,b.index,b.enabled) end
 end
 local ok,err=xpcall(function()
   for k,v in pairs(numeric) do reaper.GetSetProjectInfo(p,k,v,true) end
@@ -107,7 +120,7 @@ local ok,err=xpcall(function()
   for _,s in ipairs(track_state) do
     if excluded[guid_key(reaper.GetTrackGUID(s.track))] then reaper.SetMediaTrackInfo_Value(s.track,'B_MUTE',1) end
   end
-  for _,b in ipairs(switched) do reaper.TrackFX_SetEnabled(b.track,b.index,b.want) end
+  for _,b in ipairs(switched) do switch_quietly(b.track,b.index,b.want) end
   reaper.Main_OnCommand(42230,0)
 end,debug.traceback)
 restore()

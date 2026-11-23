@@ -386,4 +386,106 @@ function fx.pins(track, index)
   return rows
 end
 
+-- Switch a plugin on or off without an Undo point, for changes that are undone again before the
+-- request ends. TrackFX_SetEnabled adds an Undo point even outside an Undo block (REAPER 7.86), so
+-- one Ctrl+Z would flip the plugin; REAPER's own Bypass parameter of every FX (":bypass") does not.
+function fx.switch(track, index, enabled)
+  local p = reaper.TrackFX_GetParamFromIdent and reaper.TrackFX_GetParamFromIdent(track, index, ':bypass') or -1
+  if p and p >= 0 then
+    reaper.TrackFX_SetParamNormalized(track, index, p, enabled and 0 or 1)
+  else
+    reaper.TrackFX_SetEnabled(track, index, enabled)
+  end
+end
+
+-- One parameter change as a result row ({param, name, requested, before, after, value, note} or
+-- error), and whether it moved anything. A queued change (see fx.set) carries pending, its original
+-- value and the plugin it is on until fx.settle has dealt with it.
+function fx.set_row(track, index, change)
+  local row, moved = {param = change.param, requested = change.value}, false
+  local ok, err = pcall(function()
+    local p = fx.param_index(track, index, change.param)
+    row.param = p
+    local _, name = reaper.TrackFX_GetParamName(track, index, p, '')
+    row.name = name
+    local _, before = reaper.TrackFX_GetFormattedParamValue(track, index, p, '')
+    local before_value = reaper.TrackFX_GetParamNormalized(track, index, p)
+    local set_value, note, after, pending = fx.set(track, index, p, change.value, change.normalized)
+    row.before, row.after, row.note = before, after, note
+    local value = pending and set_value or reaper.TrackFX_GetParamNormalized(track, index, p)
+    row.value = math.floor(value * 1e6 + 0.5) / 1e6
+    if pending then row.pending, row.original, row.at = true, before_value, {track = track, index = index} end
+    moved = pending or value ~= before_value or after ~= before
+  end)
+  if not ok then row.error = tostring(err) end
+  return row, moved
+end
+
+local function first_line(err)
+  return (tostring(err):match('^[^\n]*'):gsub('^%[string "[^"]*"%]:%d+: ', ''))
+end
+
+-- Queued changes land when their plugins process audio: one flush_audio(track_guids, fx_switches)
+-- (50 ms offline render, bypassed plugins switched on for it) for all of them, here, so they are in
+-- place before the request's Undo point is taken; then each row says what its plugin shows. Without
+-- flush_audio, or while REAPER plays, rows stay pending with the reason in row.unverified. flush false
+-- defers it: queued rows are left as they are, to be settled after something else ran the plugins.
+-- Returns how many rows have an error.
+function fx.settle(rows, flush)
+  if flush == false then
+    local failed = 0
+    for _, row in ipairs(rows) do if row.error then failed = failed + 1 end end
+    return failed
+  end
+  local queued, tracks, switches, seen = {}, {}, {}, {}
+  local master = reaper.GetMasterTrack(project)
+  local whole_mix = false
+  for _, row in ipairs(rows) do
+    if row.pending then
+      queued[#queued + 1] = row
+      local track, index = row.at.track, row.at.index
+      local guid = reaper.GetTrackGUID(track)
+      -- The master cannot be soloed; the full mix runs its plugins as well.
+      if track == master then whole_mix = true elseif not seen[guid] then seen[guid] = true; tracks[#tracks + 1] = guid end
+      local fx_guid = reaper.TrackFX_GetFXGUID(track, index)
+      if not reaper.TrackFX_GetEnabled(track, index) and not seen[fx_guid] then
+        seen[fx_guid] = true
+        switches[#switches + 1] = {track = guid, fx = fx_guid, enabled = true}
+      end
+    end
+  end
+  local why = nil
+  if #queued > 0 and not flush then why = 'no render available'
+  elseif #queued > 0 and reaper.GetPlayStateEx(project) ~= 0 then why = 'REAPER is playing, paused or recording'
+  elseif #queued > 0 then
+    local ok, err = pcall(flush, whole_mix and {} or tracks, switches)
+    if not ok then why = first_line(err) end
+  end
+  for _, row in ipairs(queued) do
+    local track, index = row.at.track, row.at.index
+    if why then
+      row.unverified = why
+    else
+      row.pending = nil
+      local _, now = reaper.TrackFX_GetFormattedParamValue(track, index, row.param, '')
+      local value = reaper.TrackFX_GetParamNormalized(track, index, row.param)
+      if fx.same_display(now, row.after) or math.abs(value - row.value) <= 2e-6 then
+        row.after, row.note = now, (row.note or '') .. '; applied once the plugin processed audio'
+      elseif math.abs(value - row.original) <= 1e-9 then
+        -- Take the value back out of the queue, or it would land later after all.
+        reaper.TrackFX_SetParamNormalized(track, index, row.param, row.original)
+        row.after = now
+        row.error = 'The plugin did not apply the new value even while processing audio; set it in the plugin window.'
+      else
+        row.error = 'The plugin shows ' .. now .. ' instead of ' .. tostring(row.after) .. '; left as it is.'
+        row.after = now
+      end
+    end
+    row.original, row.at = nil, nil
+  end
+  local failed = 0
+  for _, row in ipairs(rows) do if row.error then failed = failed + 1 end end
+  return failed
+end
+
 return fx

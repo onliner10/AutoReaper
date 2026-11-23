@@ -71,3 +71,34 @@ def wav_peak_dbfs(path: Path, chunk_frames: int = 1 << 16):
             if values:
                 peak = max(peak, max(values), -min(values))
     return 20 * math.log10(peak) if peak > 0 else -math.inf
+
+
+def wav_drop_head(path: Path, frames: int) -> dict:
+    """Cut the first frames off a RIFF WAV in place (a render's pre-roll); returns the new wav_info."""
+    info = wav_info(path)
+    frames = max(0, min(int(frames), info['frames']))
+    if not frames:
+        return info
+    with open(path, 'rb') as f:
+        riff, _, _ = struct.unpack('<4sI4s', f.read(12))
+        if riff != b'RIFF':
+            raise ValueError(f'{path}: only RIFF WAV files can be trimmed')
+        fmt_chunk = None
+        while True:
+            chunk, size = struct.unpack('<4sI', f.read(8))
+            if chunk == b'fmt ':
+                fmt_chunk = f.read(size + (size & 1))[:size]
+            elif chunk == b'data':
+                break
+            else:
+                f.seek(size + (size & 1), 1)
+        f.seek(frames * info['block_align'], 1)
+        data = f.read((info['frames'] - frames) * info['block_align'])
+    if fmt_chunk is None:
+        raise ValueError(f'{path} has no fmt chunk')
+    body = b'WAVE' + struct.pack('<4sI', b'fmt ', len(fmt_chunk)) + fmt_chunk + (b'\0' if len(fmt_chunk) & 1 else b'')
+    body += struct.pack('<4sI', b'data', len(data)) + data + (b'\0' if len(data) & 1 else b'')
+    temporary = path.with_suffix('.trim')
+    temporary.write_bytes(b'RIFF' + struct.pack('<I', len(body)) + body)
+    temporary.replace(path)
+    return wav_info(path)

@@ -6,6 +6,7 @@
 and an optional spectrogram image.
 
     uv run --script analyze.py WAV [--compare BEFORE_WAV] [--spectrogram] [options]
+    uv run --script analyze.py table LABEL=WAV ... --baseline LABEL [--noise LABEL]
 
 Prints one JSON line (levels, bar grid source, files written), then text tables:
 - per-bar band energy (sub 20-60 Hz ... air 10-20 kHz, dBFS), total RMS, spectral centroid, side/mid;
@@ -14,6 +15,9 @@ Prints one JSON line (levels, bar grid source, files written), then text tables:
 - with --bars A-B: only those bars;
 - with --loudness: integrated LUFS (BS.1770-4 gating), max momentary/short-term, the loudest
   --window seconds, true peak (4x oversampled) and a per-bar LUFS column, also for --compare.
+`table` prints one JSON object instead: each file's levels, loudness and bands, each minus the
+baseline, and the noise floor (a second render of the baseline minus the first); compare_variants
+runs it for you.
 The bar grid comes from the capture's .json sidecar (or --bar-grid). Levels are dBFS of the
 original float samples: a full-scale sine reads -3 dB RMS in the table and 0 dB on the spectrogram.
 """
@@ -539,6 +543,61 @@ def spectrogram_title(wav, grid, duration, sidecar):
     return f'{Path(wav).stem}: {span}{when}' + (f' | solo: {isolated}' if isolated else '')
 
 
+TABLE_KEYS = ('peak_dbfs', 'rms_dbfs', 'integrated_lufs', 'max_short_term_lufs', 'true_peak_dbtp')
+
+
+def measure_file(path, window_seconds):
+    """Whole-file levels, loudness and band row of one WAV, for the variants table."""
+    samples, sample_rate, _, _, _ = load(path)
+    level = levels(samples)
+    loud, _ = loudness(samples, sample_rate, window_seconds)
+    return {'peak_dbfs': level['peak_dbfs'], 'rms_dbfs': level['rms_dbfs'],
+            **{k: loud[k] for k in ('integrated_lufs', 'max_short_term_lufs', 'true_peak_dbtp')},
+            'bands': segment_row(samples, sample_rate), 'duration_seconds': round(len(samples) / sample_rate, 6)}
+
+
+def difference(after, before):
+    """after - before for the table's levels and bands; None where either side has no value."""
+    out = {k: None if after[k] is None or before[k] is None else round(after[k] - before[k], 2) for k in TABLE_KEYS}
+    out['bands'] = {k: round(after['bands'][k] - before['bands'][k], 1) for k in DIFF_COLUMNS}
+    out['bands']['centroid_hz'] = after['bands']['centroid_hz'] - before['bands']['centroid_hz']
+    return out
+
+
+def table_main(argv):
+    """`analyze.py table LABEL=WAV ... --baseline LABEL [--noise LABEL]`: one JSON object with each file's
+    levels, loudness and bands, each file minus the baseline, and the noise floor (the --noise file, a
+    second render of the baseline, minus the baseline). A difference smaller than the noise floor's is
+    not a real change."""
+    parser = argparse.ArgumentParser(prog='analyze.py table', description=table_main.__doc__)
+    parser.add_argument('files', nargs='+', metavar='LABEL=WAV')
+    parser.add_argument('--baseline', required=True, help='label every other file is compared with')
+    parser.add_argument('--noise', help='label of a second render of the baseline')
+    parser.add_argument('--window', type=float, default=30.0, help='seconds of the loudest window')
+    args = parser.parse_args(argv)
+    files = {}
+    for item in args.files:
+        label, sep, path = item.partition('=')
+        if not sep or not label or not path:
+            parser.error(f'expected LABEL=WAV, got {item!r}')
+        if label in files:
+            parser.error(f'label {label!r} given twice')
+        files[label] = path
+    for label in filter(None, (args.baseline, args.noise)):
+        if label not in files:
+            parser.error(f'no file labelled {label!r}')
+    rows = {label: measure_file(path, args.window) for label, path in files.items()}
+    base = rows[args.baseline]
+    result = {'ok': True, 'baseline': args.baseline,
+              'files': [{'label': label, 'wav': str(Path(files[label])), **row} for label, row in rows.items()],
+              'vs_baseline': [{'label': label, **difference(row, base)} for label, row in rows.items()
+                              if label not in (args.baseline, args.noise)]}
+    if args.noise:
+        result['noise_floor'] = difference(rows[args.noise], base)
+    print(json.dumps(result, ensure_ascii=False))
+    return 0
+
+
 def parse_args(argv):
     parser = argparse.ArgumentParser(description=__doc__.split('\n\n')[0])
     parser.add_argument('wav')
@@ -576,9 +635,12 @@ def parse_args(argv):
 
 
 def main(argv=None):
-    args = parse_args(sys.argv[1:] if argv is None else argv)
+    argv = sys.argv[1:] if argv is None else argv
     for stream in (sys.stdout, sys.stderr):
         stream.reconfigure(encoding='utf-8')
+    if argv[:1] == ['table']:
+        return table_main(argv[1:])
+    args = parse_args(argv)
     samples, sample_rate, grid, start, sidecar = load(args.wav, args.bar_grid, args.wav_start)
     grid = select_bars(grid, args.bars)
     duration = len(samples) / sample_rate

@@ -174,7 +174,7 @@ def test_server_programs_compile():
     runtime = lua_module.LuaRuntime()
     compile_ = runtime.eval('function(src) local f, e = load(src) return e end')
     for body in (server.ADD_FX, server.FX_PARAMETERS, server.SET_FX_PARAMETERS, server.EDIT_FX, server.SIDECHAIN_SEND,
-                 server.RESOLVE_TRACKS, server.RESOLVE_BYPASS):
+                 server.RESOLVE_TRACKS, server.RESOLVE_BYPASS, server.SNAPSHOT_VARIANTS, server.APPLY_VARIANT, server.RUN_VARIANT):
         assert compile_(server.fx_program(body, track='Bass', fx=0)) is None
     for body in (server.ADD_FAUST_FX, server.READ_FAUST_FX, server.EDIT_FAUST_FX):
         assert compile_(server.faust_program(body, track='Lead', fx=0)) is None
@@ -483,3 +483,123 @@ def test_volume_offsets_keep_the_users_points_and_rerun_from_them():
     apply(spec(-3.0))  # a re-run starts from the stored originals, not from the -6 dB result
     assert runtime.globals().value_at('Lead', 0) == pytest.approx(10 ** (-3 / 20))
     assert runtime.globals().value_at('Pad', 0) == pytest.approx(10 ** (-3 / 20))
+
+
+# compare_variants: originals read once; each variant starts from them; a queued restore is settled too.
+SWITCHABLE = "enabled = true reaper.TrackFX_GetEnabled = function() return enabled end " \
+             "reaper.TrackFX_SetEnabled = function(_, _, e) enabled = e end "
+VARIANTS = [{'label': 'quiet', 'set': [{'track': 'Bass', 'fx': 0, 'param': 'Gain', 'value': '-18 dB', 'normalized': False}],
+             'fx': []},
+            {'label': 'off', 'set': [], 'fx': [{'track': 'Bass', 'fx': 0, 'enabled': False}]}]
+
+
+def originals(lua):
+    return [dict(row) for row in run_body(lua, server.SNAPSHOT_VARIANTS, variants=VARIANTS)['originals'].values()]
+
+
+def apply(lua, originals_, variant):
+    return run_body(lua, server.APPLY_VARIANT, originals=originals_, variant=variant or {})
+
+
+def gain(lua):
+    return lua.eval('reaper.TrackFX_GetFormattedParamValue(nil, 0, 1)')[1]
+
+
+def test_snapshot_lists_each_target_once_with_its_state(lua):
+    lua.execute(SWITCHABLE)
+    rows = originals(lua)
+    assert [(r.get('name'), r.get('value'), r.get('enabled')) for r in rows] == [('Gain', 0.5, None), (None, None, True)]
+    assert rows[0]['fx'] == '{BBBB0000-0000-0000-0000-000000000002}' and rows[0]['shown'] == '+0.0 dB'
+
+
+def test_each_variant_starts_from_the_originals(lua):
+    lua.execute(SWITCHABLE)
+    orig = originals(lua)
+    first = apply(lua, orig, VARIANTS[0])
+    assert first['failed'] == 0 and gain(lua) == '-18.0 dB' and first['changed'] is True
+    second = apply(lua, orig, VARIANTS[1])
+    assert gain(lua) == '+0.0 dB' and lua.eval('enabled') is False and len(second['unrestored']) == 0
+    back = apply(lua, orig, None)
+    assert gain(lua) == '+0.0 dB' and lua.eval('enabled') is True and back['changed'] is True
+    assert apply(lua, orig, None)['changed'] is False  # nothing left to put back
+
+
+def test_a_queued_restore_lands_before_the_next_variant_renders(lua):
+    lua.execute(QUEUED + FLUSH + SWITCHABLE + "reaper.GetPlayStateEx = function() return 0 end")
+    orig = originals(lua)
+    assert apply(lua, orig, VARIANTS[0])['rows'][1]['after'] == '-18.0 dB' and gain(lua) == '-18.0 dB'
+    # The next variant does not touch Gain: putting it back is queued too, so it is flushed and checked.
+    second = apply(lua, orig, VARIANTS[1])
+    assert gain(lua) == '+0.0 dB' and len(second['unrestored']) == 0 and lua.eval('flushed') is not None
+
+
+def test_a_restore_that_cannot_be_checked_is_reported(lua):
+    lua.execute(QUEUED + FLUSH + SWITCHABLE + "reaper.GetPlayStateEx = function() return 0 end")
+    orig = originals(lua)
+    apply(lua, orig, VARIANTS[0])
+    lua.execute("reaper.GetPlayStateEx = function() return 1 end")
+    back = apply(lua, orig, None)
+    assert back['unrestored'][1]['name'] == 'Gain' and 'playing' in back['unrestored'][1]['unverified']
+
+
+def test_temporary_switches_use_the_bypass_parameter(lua):
+    # TrackFX_SetEnabled adds an Undo point even outside an Undo block; REAPER's ":bypass" parameter does not.
+    lua.execute(SWITCHABLE + "set_enabled_calls = 0 local old = reaper.TrackFX_SetEnabled "
+                "reaper.TrackFX_SetEnabled = function(...) set_enabled_calls = set_enabled_calls + 1 return old(...) end "
+                "reaper.TrackFX_GetParamFromIdent = function(_, _, ident) return ident == ':bypass' and 3 or -1 end "
+                "local set = reaper.TrackFX_SetParamNormalized "
+                "reaper.TrackFX_SetParamNormalized = function(t, f, p, v) if p == 3 then enabled = v < .5 return true end "
+                "return set(t, f, p, v) end")
+    orig = originals(lua)
+    apply(lua, orig, VARIANTS[1])
+    assert lua.eval('enabled') is False and lua.eval('set_enabled_calls') == 0
+    apply(lua, orig, None)
+    assert lua.eval('enabled') is True and lua.eval('set_enabled_calls') == 0
+    run_body(lua, server.APPLY_VARIANT, originals=orig, variant=VARIANTS[1], keep=True)
+    assert lua.eval('enabled') is False and lua.eval('set_enabled_calls') == 1  # keep: one undoable switch
+
+
+def run_variant(lua, orig, variant):
+    # render_main stands in for the render: it runs the plugins' queue like a real render does.
+    lua.execute("rendered_gain = nil function render_main() process() "
+                "local _, shown = reaper.TrackFX_GetFormattedParamValue(nil, 0, 1) rendered_gain = shown return {ok = true} end")
+    return run_body(lua, server.RUN_VARIANT, originals=orig, variant=variant)
+
+
+def test_a_variant_is_rendered_and_undone_in_one_request(lua):
+    lua.execute(QUEUED + FLUSH + SWITCHABLE + "reaper.GetPlayStateEx = function() return 0 end")
+    orig = originals(lua)
+    result = run_variant(lua, orig, VARIANTS[0])
+    # The render heard the variant; the queued value was checked after it; the original is back.
+    assert lua.eval('rendered_gain') == '-18.0 dB' and result['rows'][1]['after'] == '-18.0 dB'
+    assert 'applied once' in result['rows'][1]['note'] and result['failed'] == 0
+    assert gain(lua) == '+0.0 dB' and len(result['unrestored']) == 0 and result['render']['ok'] is True
+
+
+def test_a_failed_render_still_puts_the_originals_back(lua):
+    lua.execute(SWITCHABLE)
+    orig = originals(lua)
+    lua.execute("function render_main() error('render exploded', 0) end")
+    result = run_body(lua, server.RUN_VARIANT, originals=orig, variant=VARIANTS[1])
+    assert result['render_error'] == 'render exploded' and lua.eval('enabled') is True
+
+
+def test_a_failed_render_with_a_queued_change_returns_plain_data(lua):
+    lua.execute(QUEUED + FLUSH + SWITCHABLE + "reaper.GetPlayStateEx = function() return 0 end "
+                "function render_main() error('render exploded', 0) end")
+    orig = originals(lua)
+    result = run_body(lua, server.RUN_VARIANT, originals=orig, variant=VARIANTS[0])
+    row = result['rows'][1]
+    assert result['render_error'] == 'render exploded' and 'at' not in row and 'original' not in row
+    assert 'render failed' in row['note'] and gain(lua) == '+0.0 dB'
+
+
+def test_a_parameter_on_a_plugin_bypassed_in_the_variant_is_not_checked(lua):
+    lua.execute(QUEUED + FLUSH + SWITCHABLE + "reaper.GetPlayStateEx = function() return 0 end")
+    orig = originals(lua)
+    both = {'label': 'x', 'set': VARIANTS[0]['set'], 'fx': [{'track': 'Bass', 'fx': 0, 'enabled': False}]}
+    lua.execute("function render_main() return {ok = true} end")  # a bypassed plugin does not process
+    result = run_body(lua, server.RUN_VARIANT, originals=orig, variant=both)
+    row = result['rows'][1]
+    assert result['failed'] == 0 and 'bypassed in this variant' in row['note'] and 'error' not in row
+    assert gain(lua) == '+0.0 dB' and lua.eval('enabled') is True and len(result['unrestored']) == 0

@@ -7,6 +7,7 @@ import json
 import math
 import os
 import re
+import shutil
 import sys
 import tempfile
 import threading
@@ -23,7 +24,7 @@ from . import faust_plugin
 from .bridge import (BRIDGE_SCRIPT_NAME, LUA, PROTOCOL, BridgeError, ReaperBridge, default_reaper_resource_path,
                      home_directory, install_bridge_script, lua_string)
 from .lua_calls import _referenced_reaper_apis
-from .wav import wav_info, wav_peak_dbfs
+from .wav import wav_drop_head, wav_info, wav_peak_dbfs
 
 # Claude Code warns above ~25k tokens of tool output; larger results go to a
 # file that Read and Grep can page through.
@@ -45,7 +46,8 @@ INSTRUCTIONS = """Tools for the user's open REAPER project, through the AutoReap
 Start with reaper_status (if the bridge is missing, guide the user through install_bridge), then
 inspect_project. Read with reaper_eval; change the project only when the user asked, with
 reaper_eval_write (one Undo step, project backed up). You cannot hear: capture renders a range to WAV; measure it with the
-reaper skill's analyze.py script. Measure before and after any change you claim helped."""
+reaper skill's analyze.py script. Measure before and after any change you claim helped; for plugin
+settings, compare_variants does both (and several settings side by side) in one call."""
 
 mcp = FastMCP('autoreaper', instructions=INSTRUCTIONS, log_level='WARNING')
 bridge = ReaperBridge()
@@ -584,65 +586,13 @@ async def fx_parameters(
 SET_FX_PARAMETERS = '''
 local track, track_name = fx.track(args.track)
 local index = fx.find(track, args.fx)
-local results, failed, changed = {}, 0, false
+local results, changed = {}, false
 for _, change in ipairs(args.changes) do
-  local row = {param = change.param, requested = change.value}
-  local ok, err = pcall(function()
-    local p = fx.param_index(track, index, change.param)
-    row.param = p
-    local _, name = reaper.TrackFX_GetParamName(track, index, p, '')
-    row.name = name
-    local _, before = reaper.TrackFX_GetFormattedParamValue(track, index, p, '')
-    local before_value = reaper.TrackFX_GetParamNormalized(track, index, p)
-    local set_value, note, after, pending = fx.set(track, index, p, change.value, change.normalized)
-    row.before, row.after, row.note = before, after, note
-    local value = pending and set_value or reaper.TrackFX_GetParamNormalized(track, index, p)
-    row.value = math.floor(value * 1e6 + 0.5) / 1e6
-    if pending then row.pending, row.original = true, before_value end
-    if pending or value ~= before_value or after ~= before then changed = true end
-  end)
-  if not ok then row.error = tostring(err); failed = failed + 1 end
+  local row, moved = fx.set_row(track, index, change)
   results[#results + 1] = row
+  changed = changed or moved
 end
--- Queued changes (see fx.set): let the plugin process 50 ms of audio here, so they land before this
--- request's Undo point is taken, then check what it shows. While playing it applies them by itself.
-local queued = {}
-for _, row in ipairs(results) do if row.pending then queued[#queued + 1] = row end end
-local flush_error = nil
-if #queued > 0 and not flush_audio then flush_error = 'no render available'
-elseif #queued > 0 and reaper.GetPlayStateEx(0) ~= 0 then flush_error = 'REAPER is playing, paused or recording'
-elseif #queued > 0 then
-  local guid = reaper.GetTrackGUID(track)
-  local switches = reaper.TrackFX_GetEnabled(track, index) and {} or
-    {{track = guid, fx = reaper.TrackFX_GetFXGUID(track, index), enabled = true}}
-  -- The master cannot be soloed; the full mix runs its plugins as well.
-  local is_master = track == reaper.GetMasterTrack(0)
-  local ok, err = pcall(flush_audio, is_master and {} or {guid}, switches)
-  if not ok then flush_error = (tostring(err):match('^[^\\n]*'):gsub('^%[string "[^"]*"%]:%d+: ', '')) end
-end
-for _, row in ipairs(queued) do
-  if flush_error then
-    row.unverified = flush_error
-  else
-    row.pending = nil
-    local _, now = reaper.TrackFX_GetFormattedParamValue(track, index, row.param, '')
-    local value = reaper.TrackFX_GetParamNormalized(track, index, row.param)
-    if fx.same_display(now, row.after) or math.abs(value - row.value) <= 2e-6 then
-      row.after, row.note = now, (row.note or '') .. '; applied once the plugin processed audio'
-    elseif math.abs(value - row.original) <= 1e-9 then
-      -- Take the value back out of the queue, or it would land later after all.
-      reaper.TrackFX_SetParamNormalized(track, index, row.param, row.original)
-      row.after = now
-      row.error = 'The plugin did not apply the new value even while processing audio; set it in the plugin window.'
-      failed = failed + 1
-    else
-      row.error = 'The plugin shows ' .. now .. ' instead of ' .. tostring(row.after) .. '; left as it is.'
-      row.after = now
-      failed = failed + 1
-    end
-  end
-  row.original = nil
-end
+local failed = fx.settle(results, flush_audio)
 return {track = track_name, fx = fx.describe(track, index), results = results, failed = failed, changed = changed}
 '''
 
@@ -1141,31 +1091,48 @@ def render_code(workspace, start_seconds, end_seconds, track_guids, switches=())
 def flush_audio_function(workspace):
     """Lua `flush_audio(track_guids, fx_switches)`: 50 ms of those tracks rendered offline, so their plugins
     run their audio callback once (and apply queued host changes); everything is restored, the WAV discarded
-    with the workspace."""
+    with the workspace. Each flush writes a file of its own: a series of variants shares one workspace."""
     return '\n'.join(['local function flush_audio(isolate_guids, fx_switches)'] + render_inputs(workspace, 0.0, .05)
-                     + [(LUA / 'render.lua').read_text(encoding='utf-8'), 'end'])
+                     + ['pattern="flush-"..reaper.genGuid():gsub("[^%x]","")',
+                        (LUA / 'render.lua').read_text(encoding='utf-8'), 'end'])
 
 
-async def render(start_seconds, end_seconds, track_guids, switches=()):
+async def render(start_seconds, end_seconds, track_guids, switches=(), around=None, label=None, project_id=None):
     """Offline-render master to a 48 kHz float WAV; REAPER's render settings, mute/solo and the plugins
-    switched for the render ({track, fx, enabled}) are restored."""
+    switched for the render ({track, fx, enabled}) are restored.
+
+    around(render_function) builds a larger program that calls the Lua `render_main()` it is given and
+    returns {render = <its result>, ...}; the extra keys come back as the 4th value. With label, that
+    program runs as one Undo block."""
     capture_id = uuid4().hex[:12]
     await asyncio.to_thread(prune_scratch)
     with render_workspace() as workspace:
         return await render_into(workspace, captures_directory(), capture_id, start_seconds, end_seconds,
-                                 track_guids, switches)
+                                 track_guids, switches, around, label, project_id)
 
 
-async def render_into(workspace, captures, capture_id, start_seconds, end_seconds, track_guids, switches):
+async def render_into(workspace, captures, capture_id, start_seconds, end_seconds, track_guids, switches,
+                      around=None, label=None, project_id=None):
     before = bridge.status()
+    if project_id and before['project_id'] != project_id:
+        raise BridgeError('Another project became active; render refused')
     code = render_code(workspace, start_seconds, end_seconds, track_guids, switches)
+    if around:
+        code = around('local function render_main()\n' + code + '\nend\n')
     began = time.monotonic()
-    receipt = await bridge.evaluate(code, project_id=before['project_id'], mutate=False, timeout=1800)
+    receipt = await bridge.evaluate(code, project_id=before['project_id'], mutate=bool(label),
+                                    label=label or 'AutoReaper render', timeout=1800)
     if not receipt.get('ok'):
         raise BridgeError(receipt.get('error', 'Offline render failed'))
     after = bridge.status()
     if after.get('project_id') != before['project_id'] or after.get('session') != before.get('session'):
         raise BridgeError('The project or bridge changed during rendering; capture rejected.')
+    extra = None
+    if around:
+        extra = dict(receipt['result'] or {})
+        if extra.get('render_error'):
+            raise BridgeError(extra['render_error'])
+        receipt = {**receipt, 'result': extra.pop('render')}
     result = empty_lists(receipt['result'], 'targets', 'soloed_tracks', 'excluded_tracks', 'bar_grid',
                          'offline_sources', 'bypassed_fx')
     rendered = workspace / 'mix.wav'
@@ -1174,7 +1141,8 @@ async def render_into(workspace, captures, capture_id, start_seconds, end_second
         raise BridgeError('The rendered length differs from the requested range; check REAPER render settings.')
     wav = captures / f'capture-{capture_id}.wav'
     rendered.replace(wav)
-    return wav, info, {**result, 'project_id': before['project_id'], 'render_wall_seconds': round(time.monotonic() - began, 3)}
+    result = {**result, 'project_id': before['project_id'], 'render_wall_seconds': round(time.monotonic() - began, 3)}
+    return (wav, info, result, extra) if around else (wav, info, result)
 
 
 RESOLVE_BYPASS = '''
@@ -1279,6 +1247,434 @@ async def capture(
         return output(summary, 'capture')
     except Exception as error:
         return output({'ok': False, 'error': f'{type(error).__name__}: {error}'}, 'capture')
+
+
+
+# ----------------------------------------------------------------- variants
+
+MAX_VARIANTS = 8
+MAX_VARIANT_AUDIO_SECONDS = 150.0
+ANALYZE_SCRIPT = Path(__file__).resolve().parents[2] / 'skills' / 'reaper' / 'scripts' / 'analyze.py'
+ANALYSIS_TIMEOUT_SECONDS = 180.0
+MAX_ANALYSIS_OUTPUT_BYTES = 4 * 1024 * 1024
+
+# What every variant may touch, resolved once and read as it is now: the state to return to.
+SNAPSHOT_VARIANTS = '''
+local originals, seen = {}, {}
+local function remember(ref, param)
+  local track, track_name = fx.track(ref.track)
+  local index = fx.find(track, ref.fx)
+  local track_guid, fx_guid = reaper.GetTrackGUID(track), reaper.TrackFX_GetFXGUID(track, index)
+  local _, fx_name = reaper.TrackFX_GetFXName(track, index, '')
+  local p = param ~= nil and fx.param_index(track, index, param) or nil
+  local key = track_guid .. fx_guid .. tostring(p)
+  if seen[key] then return end
+  seen[key] = true
+  local row = {track = track_guid, fx = fx_guid, track_name = track_name, fx_name = fx_name}
+  if p then
+    local _, name = reaper.TrackFX_GetParamName(track, index, p, '')
+    local _, shown = reaper.TrackFX_GetFormattedParamValue(track, index, p, '')
+    row.param, row.name, row.shown, row.value = p, name, shown, reaper.TrackFX_GetParamNormalized(track, index, p)
+  else
+    row.enabled = reaper.TrackFX_GetEnabled(track, index)
+  end
+  originals[#originals + 1] = row
+end
+for _, variant in ipairs(args.variants) do
+  for _, change in ipairs(variant.set or {}) do remember(change, change.param) end
+  for _, switch in ipairs(variant.fx or {}) do remember(switch) end
+end
+return {originals = originals}
+'''
+
+# Back to the originals, then one variant on top (none: just back), then queued values settled with
+# settle_flush (nil: pending with a reason; false: left for a later fx.settle). Plugins are switched without Undo points, except for keep,
+# whose switch must be undoable.
+APPLY_FUNCTION = '''
+local function apply_variant(variant, settle_flush)
+local restores, changed = {}, false
+local switch = args.keep and function(t, i, e) reaper.TrackFX_SetEnabled(t, i, e) end or fx.switch
+for _, o in ipairs(args.originals) do
+  local track = fx.track(o.track)
+  local index = fx.find(track, o.fx)
+  if o.param ~= nil then
+    local now = reaper.TrackFX_GetParamNormalized(track, index, o.param)
+    if math.abs(now - o.value) > 1e-9 then
+      reaper.TrackFX_SetParamNormalized(track, index, o.param, o.value)
+      changed = true
+      if math.abs(reaper.TrackFX_GetParamNormalized(track, index, o.param) - o.value) > 1e-9 then
+        restores[#restores + 1] = {param = o.param, name = o.name, value = o.value, after = o.shown, pending = true,
+          original = now, at = {track = track, index = index}, restore = true}
+      end
+    end
+  elseif reaper.TrackFX_GetEnabled(track, index) ~= o.enabled then
+    switch(track, index, o.enabled)
+    changed = true
+  end
+end
+local switched = {}
+for _, s in ipairs(variant.fx or {}) do
+  local track, track_name = fx.track(s.track)
+  local index = fx.find(track, s.fx)
+  if reaper.TrackFX_GetEnabled(track, index) ~= s.enabled then changed = true end
+  switch(track, index, s.enabled)
+  local _, name = reaper.TrackFX_GetFXName(track, index, '')
+  switched[#switched + 1] = {track = track_name, fx = name, enabled = reaper.TrackFX_GetEnabled(track, index)}
+end
+local rows = {}
+for _, c in ipairs(variant.set or {}) do
+  local track, track_name = fx.track(c.track)
+  local index = fx.find(track, c.fx)
+  local row, moved = fx.set_row(track, index, c)
+  local _, name = reaper.TrackFX_GetFXName(track, index, '')
+  row.track, row.fx = track_name, name
+  changed = changed or moved
+  rows[#rows + 1] = row
+  -- A queued restore of this parameter is superseded: the value set last is the one that lands.
+  for i = #restores, 1, -1 do
+    local r = restores[i]
+    if r.at.track == track and r.at.index == index and r.param == row.param then table.remove(restores, i) end
+  end
+end
+local all = {}
+for _, row in ipairs(rows) do all[#all + 1] = row end
+for _, row in ipairs(restores) do all[#all + 1] = row end
+fx.settle(all, settle_flush)
+local unrestored = {}
+for _, r in ipairs(restores) do
+  if r.error or r.pending then unrestored[#unrestored + 1] = {param = r.param, name = r.name, error = r.error,
+    unverified = r.unverified} end
+end
+local failed = 0
+for _, row in ipairs(rows) do if row.error then failed = failed + 1 end end
+return {rows = rows, fx = switched, failed = failed, unrestored = unrestored, changed = changed}
+end
+'''
+
+APPLY_VARIANT = APPLY_FUNCTION + '''
+return apply_variant(args.variant or {}, flush_audio)
+'''
+
+# One variant in one request and one Undo block: on top of the originals, rendered, and back to the
+# originals (queued restores flushed so they land inside the block). The net change is nil, so REAPER adds
+# no Undo point holding a variant (outside a block, every API parameter change makes one). No flush
+# before the render: a second render in one request runs some plugins (Auto-Tune) from a different state;
+# the render's first block applies queued values, and the rows are checked after it.
+RUN_VARIANT = APPLY_FUNCTION + '''
+local applied = apply_variant(args.variant, false)
+local ok, rendered = pcall(render_main)
+for _, row in ipairs(applied.rows) do
+  -- A plugin bypassed in this variant is not heard and did not process: nothing to check.
+  if row.pending and (not ok or not reaper.TrackFX_GetEnabled(row.at.track, row.at.index)) then
+    row.pending, row.at, row.original = nil, nil, nil
+    row.note = (row.note or '') .. (ok and '; not checked: the plugin is bypassed in this variant'
+      or '; not checked: the render failed')
+  end
+end
+if ok then fx.settle(applied.rows, function() end) end
+local back = apply_variant({}, flush_audio)
+local failed = 0
+for _, row in ipairs(applied.rows) do if row.error then failed = failed + 1 end end
+return {render = ok and rendered or nil, render_error = not ok and tostring(rendered) or nil,
+  rows = applied.rows, fx = applied.fx, failed = failed, unrestored = back.unrestored}
+'''
+
+
+class VariantChange(BaseModel):
+    track: str = Field(description='Track GUID, "master", or an exact track name.')
+    fx: str | int = Field(description='FX GUID, zero-based index in the chain, or a unique part of its name.')
+    param: int | str = Field(description='Parameter index or name (from fx_parameters).')
+    value: str | float = Field(description='Target as the plugin displays it ("-18 dB", "4:1", "Spectral"), as in '
+                                           'set_fx_parameters, or 0..1 with normalized.')
+    normalized: bool = False
+
+
+class VariantSwitch(BaseModel):
+    track: str = Field(description='Track GUID, "master", or an exact track name.')
+    fx: str | int = Field(description='FX GUID, zero-based index in the chain, or a unique part of its name.')
+    enabled: bool = Field(description='false bypasses the plugin for this variant, true switches it on.')
+
+
+class Variant(BaseModel):
+    label: str = Field(min_length=1, max_length=40, pattern=r'^[A-Za-z0-9][A-Za-z0-9 _.+-]*$',
+                       description='Short name for the tables, e.g. "thr -24" or "no ducker".')
+    set: list[VariantChange] = Field(default_factory=list, max_length=32)
+    fx: list[VariantSwitch] = Field(default_factory=list, max_length=16)
+
+
+def variant_label_errors(variants, keep):
+    labels = [v.label for v in variants]
+    reserved = {'baseline', 'baseline_end'}
+    if len(set(labels)) != len(labels):
+        return 'variant labels must be unique'
+    if reserved & set(labels):
+        return 'the labels baseline and baseline_end are reserved'
+    if any(not v.set and not v.fx for v in variants):
+        return 'every variant needs at least one set or fx entry'
+    if keep is not None and keep not in labels:
+        return f'keep names no variant ({keep!r})'
+    return None
+
+
+async def same_project(project_id):
+    """Refuse to go on when another project became active during a series."""
+    if project_id and (await asyncio.to_thread(bridge.status)).get('project_id') != project_id:
+        raise BridgeError('Another project became active during the series; stopped')
+
+
+async def apply_variant(workspace, originals, variant, *, label=None, project_id=None):
+    """One bridge request: originals back, the variant on top, queued values settled (mutate only for keep)."""
+    def program(body, **arguments):
+        return flush_audio_function(workspace) + '\n' + fx_program(body, **arguments)
+    payload = variant.model_dump() if variant is not None else {}
+    if label:
+        await same_project(project_id)
+        return await fx_write(APPLY_VARIANT, label, program, originals=originals, variant=payload, keep=True)
+    if not project_id:
+        project_id = (await asyncio.to_thread(bridge.status))['project_id']
+    # The bridge refuses the request ("Active project changed") if another project is active. In an Undo
+    # block: a restore that changes something leaves one point holding the original state, never a variant.
+    receipt = await bridge.evaluate(program(APPLY_VARIANT, originals=originals, variant=payload),
+                                    project_id=project_id, mutate=True, label=VARIANT_UNDO, timeout=120)
+    if not receipt.get('ok'):
+        raise BridgeError((receipt.get('error') or 'Applying the variant failed').splitlines()[0])
+    return receipt.get('result') or {}
+
+
+VARIANT_UNDO = 'AutoReaper: compare variants (no change)'
+# Every render of a series starts this much earlier and the head is cut off: a plugin's smoothing of a
+# value applied on the render's first block (measured: Decapitator Drive, still -33 dB off over 3 s
+# without it), compressors and reverbs settle before the range, the same way for every variant.
+VARIANT_PREROLL_SECONDS = 1.0
+
+
+async def render_variant(label, first, last, guids, project_id=None, variant=None, workspace=None, originals=None):
+    """Render one labelled WAV with a sidecar analyze.py understands; result gains peak_dbfs and warnings.
+    With variant: applied, rendered and undone in one request and Undo block; result gains its rows."""
+    await same_project(project_id)
+    preroll = min(VARIANT_PREROLL_SECONDS, first)
+    if variant is None:
+        wav, info, result = await render(first - preroll, last, guids, project_id=project_id)
+    else:
+        def around(render_main):
+            return (flush_audio_function(workspace) + '\n' + render_main
+                    + fx_program(RUN_VARIANT, originals=originals, variant=variant.model_dump()))
+        wav, info, result, extra = await render(first - preroll, last, guids, around=around, label=VARIANT_UNDO,
+                                                project_id=project_id)
+        result['applied'] = extra
+    info = await asyncio.to_thread(wav_drop_head, wav, round(preroll * info['sample_rate']))
+    result['preroll_seconds'] = preroll
+    peak = await asyncio.to_thread(wav_peak_dbfs, wav)
+    result['peak_dbfs'] = None if peak is None else round(peak, 2)
+    warnings = []
+    if result.get('offline_sources'):
+        warnings.append(f"{len(result['offline_sources'])} audio source(s) in the range are offline and rendered as "
+                        'silence; set media online (reaper.Main_OnCommand(40101, 0)) and run again')
+    elif peak is not None and peak < SILENT_CAPTURE_DBFS:
+        warnings.append(f'{label} peaks at {peak:.1f} dBFS: check muted tracks or offline media')
+    result['warnings'] = warnings
+    grid = [row for row in result.get('bar_grid') or [] if isinstance(row, dict)]
+    named = wav.with_name(f'{wav.stem}-{re.sub(r"[^A-Za-z0-9_.+-]+", "_", label)}.wav')
+    await asyncio.to_thread(wav.replace, named)
+    sidecar = {'label': label, 'wav_start_seconds': first, 'bar_grid': grid,
+               'range': {'start_seconds': first, 'end_seconds': last},
+               'isolated_tracks': result.get('targets') or [], 'render_wall_seconds': result.get('render_wall_seconds')}
+    await asyncio.to_thread(named.with_suffix('.json').write_text, json.dumps(sidecar, ensure_ascii=False, indent=1),
+                            encoding='utf-8')
+    return str(named), result
+
+
+def analysis_command(files, baseline, noise):
+    """(argv, None) for analyze.py table through uv, or (None, why not)."""
+    uv = shutil.which('uv')
+    if not uv:
+        return None, 'uv is not on PATH, so analyze.py could not run; measure the WAVs yourself'
+    if not ANALYZE_SCRIPT.is_file():
+        return None, f'analyze.py not found at {ANALYZE_SCRIPT}'
+    args = [uv, 'run', '--quiet', '--script', str(ANALYZE_SCRIPT), 'table',
+            *(f'{label}={path}' for label, path in files), '--baseline', baseline]
+    return (args + ['--noise', noise] if noise else args), None
+
+
+async def run_analysis(files, baseline, noise):
+    """analyze.py table in its own process: (result, None) or (None, why). Never raises, never hangs."""
+    try:
+        return await analysis_process(files, baseline, noise)
+    except Exception as error:  # the WAVs are what matters; never lose them over the measurement
+        return None, f'analysis failed: {type(error).__name__}: {error}'
+
+
+async def analysis_process(files, baseline, noise):
+    args, why = analysis_command(files, baseline, noise)
+    if why:
+        return None, why
+    env = {k: v for k, v in os.environ.items() if k not in ('VIRTUAL_ENV', 'UV_PROJECT_ENVIRONMENT')}
+    env['PYTHONIOENCODING'] = 'utf-8'
+    try:
+        process = await asyncio.create_subprocess_exec(*args, stdin=asyncio.subprocess.DEVNULL,
+                                                       stdout=asyncio.subprocess.PIPE,
+                                                       stderr=asyncio.subprocess.PIPE, env=env)
+    except OSError as error:
+        return None, f'could not start analyze.py: {error}'
+    try:
+        out, err = await asyncio.wait_for(process.communicate(), ANALYSIS_TIMEOUT_SECONDS)
+    except asyncio.TimeoutError:
+        process.kill()
+        await process.wait()
+        return None, f'analyze.py took over {ANALYSIS_TIMEOUT_SECONDS:g} s and was stopped'
+    if process.returncode != 0:
+        tail = err.decode('utf-8', 'replace').strip().splitlines()[-3:]
+        return None, f'analyze.py failed (exit {process.returncode}): ' + ' | '.join(tail)[-600:]
+    if len(out) > MAX_ANALYSIS_OUTPUT_BYTES:
+        return None, 'analyze.py printed more than expected; measure the WAVs yourself'
+    try:
+        result = json.loads(out.decode('utf-8', 'replace').strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        return None, 'analyze.py did not print JSON'
+    return (result, None) if isinstance(result, dict) and result.get('ok') else (None, 'analyze.py reported no result')
+
+
+def compact_analysis(result):
+    """Per label: levels and bands as differences from the baseline, plus the noise floor."""
+    rows = {row['label']: row for row in result.get('files') or []}
+    base = rows.get(result.get('baseline'), {})
+    return {
+        'baseline': {k: base.get(k) for k in ('peak_dbfs', 'rms_dbfs', 'integrated_lufs', 'max_short_term_lufs',
+                                              'true_peak_dbtp', 'bands')},
+        'vs_baseline': result.get('vs_baseline') or [],
+        'noise_floor': result.get('noise_floor'),
+        'note': 'Differences are variant minus baseline in dB (centroid in Hz). Only differences clearly larger '
+                'than noise_floor (baseline rendered again at the end) are real.',
+    }
+
+
+@mcp.tool(annotations=FX_WRITE, structured_output=False)
+async def compare_variants(
+        variants: Annotated[list[Variant], Field(min_length=1, max_length=MAX_VARIANTS, description=(
+            'Settings to compare against the project as it is. Each variant starts from the original state: its '
+            'set entries change plugin parameters, its fx entries switch plugins on or off.'))],
+        start_bar: Annotated[int | None, Field(description='First bar, 1 = first measure.')] = None,
+        end_bar: Annotated[int | None, Field(description='Bar after the last one rendered (exclusive).')] = None,
+        start_seconds: Annotated[float | None, Field(description='Alternative to bars: project time.')] = None,
+        end_seconds: float | None = None,
+        track_guids: Annotated[list[str] | None, Field(
+            description='Solo these tracks (GUIDs or exact names), as in capture; omit for the full mix.')] = None,
+        keep: Annotated[str | None, Field(description=(
+            'Label of the variant to leave in the project (one Undo step); omit to return everything to how it '
+            'was.'))] = None) -> str:
+    """Try plugin settings and hear them by numbers in one call: renders the range as it is (baseline), then
+    each variant, then the baseline again, and measures all WAVs with the reaper skill's analyze.py: peak,
+    RMS, LUFS and band levels per variant as differences from the baseline, and the noise floor between
+    the two baseline renders (random modulation, plugin state). Use it for any A/B of parameter values or of
+    a plugin switched off, including a single before/after (one variant with keep). Keep ranges short (2-4
+    bars); each render costs about 1-3 s. Every variant starts from the original state; afterwards the
+    original state is restored (also after an error) unless keep names a variant. Each variant is applied,
+    rendered and undone in one Undo block, so the history can gain one entry per variant, named
+    "(no change)" and holding the original state (plugins whose state moves when they process audio,
+    such as Soundtoys, cause it); undoing them changes nothing. keep adds one entry for the kept variant. Every render starts 1 s
+    early (pre-roll, cut off) so new values and dynamics have settled. Returns each variant's readback,
+    its WAV (with a .json sidecar, for further analyze.py runs) and the measurements; if analyze.py cannot
+    run, the WAVs are still returned. Do not edit the project from another session while it runs."""
+    try:
+        mode, start, end = capture_range(start_bar, end_bar, start_seconds, end_seconds)
+        refs = coerce_track_guids(track_guids)
+        problem = variant_label_errors(variants, keep)
+        if problem:
+            raise ValueError(problem)
+    except ValueError as error:
+        return output({'ok': False, 'error': f'Bad arguments: {error}'}, 'compare_variants')
+    result = {'ok': False}
+    try:
+        guids = await track_guids_for(refs)
+        if mode == 'bars':
+            musical = await bar_range(start, end)
+            first, last = musical['start_seconds'], musical['end_seconds']
+        else:
+            first, last = start, end
+        renders = len(variants) + 2
+        if (last - first) * renders > MAX_VARIANT_AUDIO_SECONDS:
+            raise ValueError(f'{renders} renders of {last - first:.1f} s exceed {MAX_VARIANT_AUDIO_SECONDS:g} s of '
+                             'audio; use a shorter range or fewer variants')
+        snap = await read_query(fx_program(SNAPSHOT_VARIANTS, variants=[v.model_dump() for v in variants]),
+                                'Read variant targets')
+        if not snap.get('ok'):
+            raise ValueError((snap.get('error') or 'Could not resolve the variant targets').splitlines()[0])
+        originals = snap.get('originals') or []
+        project_id = (await asyncio.to_thread(bridge.status))['project_id']
+        await asyncio.to_thread(prune_scratch)
+        result.update({'range': {'start_seconds': first, 'end_seconds': last,
+                                 **({'start_bar': start, 'end_bar_exclusive': end} if mode == 'bars' else {})},
+                       'variants': []})
+        files, restore = [], None
+        result['files'] = []
+        with render_workspace() as workspace:
+            try:
+                wav, info = await render_variant('baseline', first, last, guids, project_id)
+                result['isolated_tracks'] = info.get('targets') or []
+                result['warnings'] = list(info.get('warnings') or [])
+                if info.get('preroll_seconds', 0) < VARIANT_PREROLL_SECONDS:
+                    result['warnings'].append(f"The range starts {first:.2f} s into the project, leaving "
+                                              f"{info.get('preroll_seconds', 0):.2f} s of pre-roll: plugins smoothing a "
+                                              'new value may still be on their way at the start')
+                files.append(('baseline', wav))
+                result['files'] = [{'label': label, 'wav': path} for label, path in files]
+                for variant in variants:
+                    row = {'label': variant.label}
+                    result['variants'].append(row)
+                    row['wav'], rendered = await render_variant(variant.label, first, last, guids, project_id,
+                                                                variant, workspace, originals)
+                    applied = rendered.get('applied') or {}
+                    row.update({k: applied.get(k) for k in ('rows', 'fx') if applied.get(k)})
+                    for change in row.get('rows') or []:
+                        if change.get('pending'):
+                            change['note'] = f"{change.get('note') or ''}; {PENDING_NOTE} (not verified: {change.pop('unverified', '?')})"
+                    if applied.get('unrestored'):
+                        row['unrestored'] = applied['unrestored']
+                    if applied.get('failed'):
+                        row['error'] = f"{applied['failed']} change(s) failed (see rows); rendered anyway"
+                    row['peak_dbfs'] = rendered.get('peak_dbfs')
+                    result['warnings'] += [w for w in rendered.get('warnings') or [] if w not in result['warnings']]
+                    files.append((variant.label, row['wav']))
+                    result['files'].append({'label': variant.label, 'wav': row['wav']})
+            finally:
+                try:
+                    back = await apply_variant(workspace, originals, None, project_id=project_id)
+                    restore = {'ok': not back.get('unrestored'), **({'unrestored': back['unrestored']}
+                                                                    if back.get('unrestored') else {})}
+                except Exception as error:  # report, never mask the original error
+                    restore = {'ok': False, 'error': str(error)}
+                if not restore['ok']:
+                    restore['originals'] = [{k: o.get(k) for k in ('track_name', 'fx_name', 'name', 'shown', 'enabled')}
+                                            for o in originals]
+                    restore['note'] = ('Some plugin settings may still differ from before this call; originals lists '
+                                       'what they were.')
+                result['restored'] = restore
+            noise = None
+            if restore['ok']:
+                wav, _ = await render_variant('baseline_end', first, last, guids, project_id)
+                files.append(('baseline_end', wav))
+                result['files'].append({'label': 'baseline_end', 'wav': wav})
+                noise = 'baseline_end'
+                if keep is not None:
+                    kept = await apply_variant(workspace, originals, next(v for v in variants if v.label == keep),
+                                               label=f'Keep variant {keep}', project_id=project_id)
+                    result['kept'] = {'label': keep, 'ok': bool(kept.get('ok')) and not kept.get('failed'),
+                                      'undo': kept.get('undo'), **({'error': kept['error']} if kept.get('error') else {})}
+        analysis, why = await run_analysis(files, 'baseline', noise)
+        if analysis:
+            result['analysis'] = compact_analysis(analysis)
+        else:
+            result['analysis_error'] = why
+        failed = [v['label'] for v in result['variants'] if v.get('error')]
+        result['ok'] = result['restored']['ok'] and not failed and (keep is None or result.get('kept', {}).get('ok'))
+        if failed:
+            result['error'] = 'Some changes failed in: ' + ', '.join(failed)
+        elif not result['restored']['ok']:
+            result['error'] = 'The original settings could not all be restored (see restored).'
+        return output(empty_lists(result, 'variants', 'files', 'warnings'), 'compare_variants')
+    except Exception as error:
+        result.update({'ok': False, 'error': f'{type(error).__name__}: {error}'})
+        return output(result, 'compare_variants')
 
 
 def main():

@@ -16,6 +16,7 @@ track, existing automation lanes) and work with that, or propose the addition an
 | `fx_parameters` | What the plugin exposes: index, name, 0..1 value, value as displayed, display range, settings of switch/list parameters. `query` filters by name; `pins: true` lists input pins |
 | `set_fx_parameters` | Set by display value ("130 Hz", "1.2 kHz", "-18 dB", "4:1", "35 %", "Spectral", "On"), read back. One Undo step for the batch |
 | `edit_fx` | bypass / enable / offline / online / remove / move / show (opens the window for the user) |
+| `compare_variants` | Render the range as it is and with up to 8 settings (parameters, plugins on/off), measured against each other and the noise floor; restores the original, or keeps one variant |
 | `sidechain_send` | Audio or MIDI sidechain send, including the plugin's sidechain pins |
 
 Tracks are a GUID, `"master"` or an exact unique name; an FX is its GUID, chain index or a unique
@@ -39,8 +40,8 @@ part of its name. Prefer GUIDs from `inspect_project` when names repeat.
    audio"). Setting such parameters with `reaper_eval_write` instead leaves them queued and the
    readback stale; do not work around a failure that way. A row still marked `pending` (REAPER was
    playing, or the render could not run) applies on the next playback or capture.
-3. **Measure the effect** (`capture` + `analyze.py --compare`) on the same range before and after,
-   ideally on the track solo and in the mix. When comparing plugins or settings, match levels first, or
+3. **Measure the effect** with `compare_variants` (one call: before, each setting, measured), ideally
+   on the track solo and in the mix; it restores the original settings unless you `keep` one. When comparing plugins or settings, match levels first, or
    the louder one wins.
 4. **Keep changes reversible.** Every tool call is one Undo step (`sidechain_send` included, also for
    pin changes). To compare alternatives, add the new plugin bypassed, set it up, then switch which one
